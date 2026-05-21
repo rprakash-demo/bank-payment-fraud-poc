@@ -2,50 +2,30 @@ package com.bank;
 
 import org.apache.camel.main.Main;
 import org.apache.camel.builder.RouteBuilder;
-import org.apache.activemq.ActiveMQConnectionFactory;
-import org.apache.camel.component.jms.JmsComponent;
-import org.apache.camel.model.rest.RestBindingMode;
 
 public class PaymentApp {
     public static void main(String[] args) throws Exception {
-        // Use environment variable or default to 8080
-        int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
-        
         Main main = new Main();
-        ActiveMQConnectionFactory cf = new ActiveMQConnectionFactory("vm://localhost?broker.persistent=false");
-        main.bind("jms", JmsComponent.jmsComponentAutoAcknowledge(cf));
-
         main.configure().addRoutesBuilder(new RouteBuilder() {
             @Override
             public void configure() {
-                // Configure Undertow web server
-                restConfiguration()
-                    .component("undertow")
-                    .host("0.0.0.0")
-                    .port(port)
-                    .bindingMode(RestBindingMode.off);
+                // We use a direct endpoint to avoid all REST configuration/parsing
+                from("undertow:http://0.0.0.0:8080/api/payment")
+                    .log("Payment received")
+                    .to("direct:validatePayment");
 
-                // 1. REST Entry point: Calls 'direct:processPayment'
-                rest("/api").post("/payment")
-                    .to("direct:processPayment");
+                from("direct:validatePayment")
+                    .to("seda:payment.incoming");
 
-                // 2. Bridge REST to JMS: Sends to queue and returns response immediately
-                from("direct:processPayment")
-                    .to("jms:queue:payment.incoming")
-                    .setBody(constant("{\"status\": \"ACCEPTED\"}"))
-                    .setHeader("Content-Type", constant("application/json"));
+                from("seda:payment.incoming")
+                    .marshal().jacksonXml()
+                    .to("seda:fraud.check.queue");
 
-                // 3. Background Logic: Asynchronous processing
-                from("jms:queue:payment.incoming")
-                    .log("Payment received in queue")
-                    .to("jms:queue:fraud.check.queue");
-
-                from("jms:queue:fraud.check.queue")
-                    .log("Fraud check processed for message");
+                from("seda:fraud.check.queue")
+                    .setBody(constant("<response><status>APPROVED</status></response>"))
+                    .to("seda:payment.reply.queue");
             }
         });
-        
-        System.out.println("Payment Engine starting on port " + port);
         main.run(args);
     }
 }

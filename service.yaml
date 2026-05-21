@@ -1,0 +1,47 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/ingress-status: all
+    run.googleapis.com/maxScale: '3'
+    run.googleapis.com/urls: '["https://payment-fraud-engine-final-1033590531666.europe-west3.run.app","https://payment-fraud-engine-final-o3o5ycvrka-ey.a.run.app"]'
+  labels:
+    cloud.googleapis.com/location: europe-west3
+    run.googleapis.com/satisfiesPzs: 'true'
+  name: payment-fraud-engine-final
+  namespace: '1033590531666'
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '3'
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/client-version: 568.0.0
+        run.googleapis.com/startup-cpu-boost: 'true'
+      labels:
+        client.knative.dev/nonce: mxfadzcqef
+        run.googleapis.com/startupProbeType: Default
+    spec:
+      containerConcurrency: 80
+      containers:
+      - image: europe-west3-docker.pkg.dev/project-45010a7d-b34f-44a6-a4d/cloud-run-source-deploy/payment-fraud-engine:final
+        ports:
+        - containerPort: 8080
+          name: http1
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        startupProbe:
+          failureThreshold: 24
+          periodSeconds: 10
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+      serviceAccountName: 1033590531666-compute@developer.gserviceaccount.com
+      timeoutSeconds: 300
+  traffic:
+  - latestRevision: true
+    percent: 100
