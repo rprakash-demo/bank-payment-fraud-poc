@@ -1,3 +1,9 @@
 target/
-.mvn/
-*.jar
+.settings/
+.project
+.classpath
+.metadata/
+*.log
+.DS_Store
+.idea/
+*.iml
