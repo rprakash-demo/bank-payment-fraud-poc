@@ -1,1 +1,15 @@
+# Build output
 target/
+*.class
+
+# IDE files
+.classpath
+.project
+.settings/
+.idea/
+.vscode/
+
+# System files
+.DS_Store
+__MACOSX/
+*.logtarget/
