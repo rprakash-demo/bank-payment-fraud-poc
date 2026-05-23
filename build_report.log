@@ -1,0 +1,7 @@
+--- Starting FCS Validation Tests ---
+✅ [1;32mPASS:[0m Suspicious (Name)
+✅ [1;32mPASS:[0m Suspicious (Country)
+✅ [1;32mPASS:[0m High-risk threshold
+✅ [1;32mPASS:[0m Approved (Standard)
+
+Results: 4 passed, 0 failed

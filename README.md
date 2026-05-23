@@ -85,7 +85,7 @@ Maven configuration file that defines the entire build.
 
 **Key highlights:**
 - 📦 Bundles `camel-core`, `camel-main`, `camel-netty-http`, `logback-classic` into one deployable artifact
-- 📌 Pins **Java 17** and **Camel 3.20** for consistent builds across machines and CI/CD pipelines
+- 📌 Pins **Java 17** and **Camel 4.8.3** for consistent builds across machines and CI/CD pipelines
 - 🏗️ `maven-shade-plugin` merges all dependencies into a single ~20MB fat JAR
 
 ---
@@ -892,7 +892,7 @@ gcloud run services replace service.yaml --region=europe-west3
 | Layer | Technology |
 |---|---|
 | Language | Java 17 |
-| Integration framework | Apache Camel 3.20 |
+| Integration framework | Apache Camel 4.8.3 |
 | HTTP transport | camel-netty-http (Netty 4) |
 | Messaging (planned) | Apache ActiveMQ (JMS) |
 | Serialisation | XML (payments & BS↔FCS) · JSON (broker API & REST) |
@@ -963,4 +963,4 @@ The live demo must run both solutions end-to-end. No PowerPoint-only presentatio
 
 ---
 
-*PoC: Bank Payment Fraud Detection · Java 17 · Apache Camel 3.20 · Apache ActiveMQ · Google Cloud Run*
+*PoC: Bank Payment Fraud Detection · Java 17 · Apache Camel 4.8.3 · Apache ActiveMQ · Google Cloud Run*

@@ -1,15 +1,12 @@
-# Use a multi-stage build
-FROM maven:3.8-eclipse-temurin-17 AS build
+# Assuming your Dockerfile has a build stage
+FROM maven:3.9.6-eclipse-temurin-17 AS build
 WORKDIR /app
 COPY pom.xml .
 COPY src ./src
-# Build the JAR
 RUN mvn clean package -DskipTests
 
-# Use a lightweight JRE for the final image
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
-# Copy the built JAR from the build stage
+# The shade plugin replaces your main jar. Use the standard project name.
 COPY --from=build /app/target/payment-fraud-poc-1.0-SNAPSHOT.jar app.jar
-EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]

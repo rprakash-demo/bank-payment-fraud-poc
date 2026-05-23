@@ -1,60 +1,65 @@
 package com.bank;
 
-import org.apache.camel.main.Main;
 import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.model.rest.RestBindingMode;
 import org.apache.camel.Exchange;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
-public class PaymentApp {
-    public static void main(String[] args) throws Exception {
-        Main main = new Main();
+public class PaymentApp extends RouteBuilder {
+
+    @Override
+    public void configure() throws Exception {
+        // REST Configuration
+        restConfiguration()
+            .component("netty-http")
+            .host("0.0.0.0").port(8080)
+            .bindingMode(RestBindingMode.json)
+            .enableCORS(true);
+
+        // --- AUDIT QUEUE ---
+        from("jms:queue:auditQueue")
+            .routeId("audit-logger")
+            .log("AUDIT SYSTEM: Persisting transaction: ${body}");
+
+        // --- FAST TRACK (Synchronous) ---
+        rest("/api/v1/payment-fast").post().to("direct:rest-flow");
         
-        main.configure().addRoutesBuilder(new RouteBuilder() {
-            @Override
-            public void configure() {
-                getContext().setStreamCaching(true);
+        from("direct:rest-flow")
+            .routeId("solution-2-rest")
+            .setHeader("correlationId", simple("${uuid}"))
+            .wireTap("jms:queue:auditQueue")
+            
+            // MANDATORY SECURITY GATE
+            .choice()
+                .when(simple("${body[payerName]} == 'Bad Actor' || ${body[payeeName]} == 'Bad Actor'"))
+                    .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(403))
+                    .setBody(simple("{\"status\":\"REJECTED\", \"reason\":\"BLACKLISTED_NAME\", \"correlationId\":\"${header.correlationId}\"}"))
+                    .stop()
+                .when(simple("${body[amount]} > 10000"))
+                    .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(403))
+                    .setBody(simple("{\"status\":\"REJECTED\", \"reason\":\"LIMIT_EXCEEDED\", \"correlationId\":\"${header.correlationId}\"}"))
+                    .stop()
+            .end()
+            
+            // BUSINESS LOGIC
+            .choice()
+                .when(simple("${body[amount]} > 100"))
+                    .to("direct:mock-external-fraud-engine")
+                .otherwise()
+                    .setBody(simple("{\"status\":\"APPROVED\", \"engine\":\"Local-Internal-Check\", \"correlationId\":\"${header.correlationId}\"}"))
+            .end();
 
-                from("netty-http:http://0.0.0.0:8080/api/payment")
-                    .process(exchange -> {
-                        InputStream is = exchange.getIn().getBody(InputStream.class);
-                        String body = (is != null) ? new String(is.readAllBytes(), StandardCharsets.UTF_8) : "";
-                        
-                        String status;
+        // --- MOCK FRAUD ENGINE ---
+        from("direct:mock-external-fraud-engine")
+            .setBody(simple("{\"status\":\"APPROVED\", \"engine\":\"Mock-External-REST\", \"correlationId\":\"${header.correlationId}\"}"));
 
-                        // 1. Mandatory Field Validation
-                        if (!body.contains("<amount>") || !body.contains("<payerName>") || !body.contains("<payerCountry>")) {
-                            status = "INVALID_REQUEST";
-                        }
-                        // 2. Blacklist Fraud Check
-                        else if (body.contains("Mark Imaginary") || body.contains("Govind Real") || 
-                                 body.contains("Shakil Maybe") || body.contains("Chang Imagine") ||
-                                 body.contains(">CUB<") || body.contains(">IRQ<") || body.contains(">IRN<") || 
-                                 body.contains(">PRK<") || body.contains(">SDN<") || body.contains(">SYR<") ||
-                                 body.contains("BANK OF KUNLUN") || body.contains("KARAMAY CITY COMMERCIAL BANK") ||
-                                 body.contains("Artillery Procurement") || body.contains("Lethal Chemicals payment")) {
-                            status = "Suspicious payment";
-                        }
-                        // 3. Threshold Check
-                        else {
-                            try {
-                                String amountStr = body.split("<amount>")[1].split("</amount>")[0].trim();
-                                if (Double.parseDouble(amountStr) > 5000) {
-                                    status = "REVIEW_REQUIRED";
-                                } else {
-                                    status = "Nothing found, all okay.";
-                                }
-                            } catch (Exception e) {
-                                status = "INVALID_REQUEST";
-                            }
-                        }
-
-                        exchange.getMessage().setBody("<response><status>" + status + "</status></response>");
-                        exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 200);
-                        exchange.getMessage().setHeader("Content-Type", "application/xml");
-                    });
-            }
-        });
-        main.run(args);
+        // --- SECURE FLOW (Asynchronous) ---
+        rest("/api/v1/payment-secure").post().to("direct:messaging-flow");
+        
+        from("direct:messaging-flow")
+            .routeId("solution-1-messaging")
+            .setHeader("correlationId", simple("${uuid}")) // Ensuring ID is present
+            .wireTap("jms:queue:auditQueue")
+            .setBody(simple("{\"status\":\"ACCEPTED_FOR_PROCESSING\", \"correlationId\":\"${header.correlationId}\"}"));
     }
 }
