@@ -2,6 +2,7 @@
 
 # Fraud Check System: Manual Test Suite
 # Purpose: Verbose debugging with JSON payloads to match PaymentApp.java
+# Note: Ensure these endpoints match your @RequestMapping in the Controller.
 
 # Navigate to project root
 cd "$(dirname "$0")/.."
@@ -23,17 +24,20 @@ echo -e "${BOLD}${YELLOW}>>> Testing: Suspicious Name (Blacklist) >>>${NC}"
 curl -v -X POST http://localhost:8080/api/v1/payment-fast \
   -H "Content-Type: application/json" \
   -d '{"payerName":"Mark Imaginary", "payeeName":"John Doe", "amount":50, "payerCountryCode":"DEU"}'
+sleep 1
 
 # 2. Test High Value (Fraud Engine)
 echo -e "\n\n${BOLD}${YELLOW}>>> Testing: High-Value Payment (Expect: Mock-External) >>>${NC}"
 curl -v -X POST http://localhost:8080/api/v1/payment-fast \
   -H "Content-Type: application/json" \
   -d '{"payerName":"Alice", "payeeName":"Bob", "amount":500, "payerCountryCode":"DEU"}'
+sleep 1
 
 # 3. Test Approved Payment
 echo -e "\n\n${BOLD}${BOLD_GREEN}>>> Testing: Approved Payment (Expect: Local-Internal) >>>${NC}"
 curl -v -X POST http://localhost:8080/api/v1/payment-fast \
   -H "Content-Type: application/json" \
   -d '{"payerName":"John Doe", "payeeName":"Jane Smith", "amount":50, "payerCountryCode":"DEU"}'
+sleep 1
 
-echo -e "\n\n${BOLD}${MAGENTA}=== Debugging Complete ===${NC}\n"
+echo -e "\n\n${BOLD}${MAGENTA}=== Debugging Complete: Check Audit Log for results ===${NC}\n"

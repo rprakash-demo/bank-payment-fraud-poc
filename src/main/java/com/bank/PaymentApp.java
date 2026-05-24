@@ -1,65 +1,75 @@
 package com.bank;
 
 import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.component.jacksonxml.JacksonXMLDataFormat;
 import org.apache.camel.model.rest.RestBindingMode;
-import org.apache.camel.Exchange;
-import java.util.Map;
 
 public class PaymentApp extends RouteBuilder {
 
     @Override
     public void configure() throws Exception {
-        // REST Configuration
+        // Configure REST component
         restConfiguration()
             .component("netty-http")
             .host("0.0.0.0").port(8080)
-            .bindingMode(RestBindingMode.json)
-            .enableCORS(true);
+            .bindingMode(RestBindingMode.auto);
 
-        // --- AUDIT QUEUE ---
-        from("jms:queue:auditQueue")
-            .routeId("audit-logger")
-            .log("AUDIT SYSTEM: Persisting transaction: ${body}");
+        // 1. SYNCHRONOUS FCS GATEWAY (XML Interface)
+        rest("/api/payment")
+            .post()
+            .consumes("application/xml")
+            .produces("application/xml")
+            .to("direct:fcs-xml-process");
 
-        // --- FAST TRACK (Synchronous) ---
-        rest("/api/v1/payment-fast").post().to("direct:rest-flow");
-        
-        from("direct:rest-flow")
-            .routeId("solution-2-rest")
-            .setHeader("correlationId", simple("${uuid}"))
+        from("direct:fcs-xml-process")
+            .routeId("fcs-xml-gateway")
+            .unmarshal(new JacksonXMLDataFormat())
+            .setHeader("correlationId", simple("${body[transactionId]}"))
             .wireTap("jms:queue:auditQueue")
-            
-            // MANDATORY SECURITY GATE
             .choice()
-                .when(simple("${body[payerName]} == 'Bad Actor' || ${body[payeeName]} == 'Bad Actor'"))
-                    .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(403))
-                    .setBody(simple("{\"status\":\"REJECTED\", \"reason\":\"BLACKLISTED_NAME\", \"correlationId\":\"${header.correlationId}\"}"))
-                    .stop()
-                .when(simple("${body[amount]} > 10000"))
-                    .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(403))
-                    .setBody(simple("{\"status\":\"REJECTED\", \"reason\":\"LIMIT_EXCEEDED\", \"correlationId\":\"${header.correlationId}\"}"))
-                    .stop()
-            .end()
-            
-            // BUSINESS LOGIC
-            .choice()
-                .when(simple("${body[amount]} > 100"))
-                    .to("direct:mock-external-fraud-engine")
+                .when(simple("${body[payerName]} regex 'Mark Imaginary|Govind Real|Shakil Maybe|Chang Imagine' || " +
+                               "${body[payeeName]} regex 'Mark Imaginary|Govind Real|Shakil Maybe|Chang Imagine' || " +
+                               "${body[payerCountryCode]} regex 'CUB|IRQ|IRN|PRK|SDN|SYR' || " +
+                               "${body[payeeCountryCode]} regex 'CUB|IRQ|IRN|PRK|SDN|SYR' || " +
+                               "${body[payerBank]} regex '(?i)BANK OF KUNLUN|KARAMAY CITY COMMERCIAL BANK' || " +
+                               "${body[payeeBank]} regex '(?i)BANK OF KUNLUN|KARAMAY CITY COMMERCIAL BANK' || " +
+                               "${body[paymentInstruction]} regex 'Artillery Procurement|Lethal Chemicals payment'"))
+                    .to("direct:xml-reject")
                 .otherwise()
-                    .setBody(simple("{\"status\":\"APPROVED\", \"engine\":\"Local-Internal-Check\", \"correlationId\":\"${header.correlationId}\"}"))
+                    .to("direct:xml-approve")
             .end();
 
-        // --- MOCK FRAUD ENGINE ---
-        from("direct:mock-external-fraud-engine")
-            .setBody(simple("{\"status\":\"APPROVED\", \"engine\":\"Mock-External-REST\", \"correlationId\":\"${header.correlationId}\"}"));
+        from("direct:xml-approve")
+            .setBody(simple("<response><status>APPROVED</status><message>Nothing found, all okay</message></response>"));
 
-        // --- SECURE FLOW (Asynchronous) ---
-        rest("/api/v1/payment-secure").post().to("direct:messaging-flow");
-        
-        from("direct:messaging-flow")
-            .routeId("solution-1-messaging")
-            .setHeader("correlationId", simple("${uuid}")) // Ensuring ID is present
+        from("direct:xml-reject")
+            .setBody(simple("<response><status>REJECTED</status><message>Suspicious payment</message></response>"));
+
+        // 2. ASYNCHRONOUS SECURE PROCESSING
+        rest("/api/payment-secure")
+            .post()
+            .to("direct:async-entry");
+
+        from("direct:async-entry")
+            .setHeader("correlationId", simple("${body[transactionId]}"))
             .wireTap("jms:queue:auditQueue")
-            .setBody(simple("{\"status\":\"ACCEPTED_FOR_PROCESSING\", \"correlationId\":\"${header.correlationId}\"}"));
+            .to("jms:queue:paymentProcessingQueue")
+            .setBody(constant("{\"status\":\"ACCEPTED_FOR_PROCESSING\"}"));
+
+        // 3. ASYNC BACKGROUND WORKER (Fraud Validation)
+        from("jms:queue:paymentProcessingQueue")
+            .routeId("async-transaction-validator")
+            .choice()
+                .when(simple("${body[payerName]} regex 'Mark Imaginary|Govind Real|Shakil Maybe|Chang Imagine' || " +
+                               "${body[payerCountryCode]} regex 'CUB|IRQ|IRN|PRK|SDN|SYR'"))
+                    .log("ASYNC_REJECTED: Transaction ${header.correlationId} flagged for fraud.")
+                .otherwise()
+                    .log("ASYNC_APPROVED: Transaction ${header.correlationId} processed successfully.")
+            .end();
+
+        // 4. AUDIT LOGGING
+        from("jms:queue:auditQueue")
+            .routeId("audit-logger")
+            .log("AUDIT_TRACE [ID: ${header.correlationId}]: ${body}");
     }
 }

@@ -2,43 +2,37 @@
 # Color codes
 GREEN='\033[1;32m'
 RED='\033[1;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Base URL - Note: using /api/v1/payment-fast for validation
-URL="http://localhost:8080/api/v1/payment-fast"
+URL="http://localhost:8080/api/payment"
 PASS=0; FAIL=0
 
+# Generalized test runner
 run_test() {
-  local desc="$1" payload="$2" expected="$3"
+  local desc="$1" content_type="$2" payload="$3" expected="$4"
   
-  # Using application/json as per your working app
-  actual=$(curl -s -X POST "$URL" -H "Content-Type: application/json" -d "$payload")
+  actual=$(curl -s -X POST "$URL" -H "Content-Type: $content_type" -d "$payload")
   
   if echo "$actual" | grep -q "$expected"; then
-    echo -e "✅ ${GREEN}PASS:${NC} $desc"
+    echo -e "✅ ${GREEN}PASS:${NC} $desc ($content_type)"
     ((PASS++))
   else
-    echo -e "❌ ${RED}FAIL:${NC} $desc — expected '$expected', got: $actual"
+    echo -e "❌ ${RED}FAIL:${NC} $desc ($content_type) — expected '$expected', got: '$actual'"
     ((FAIL++))
   fi
 }
 
-echo "--- Starting FCS Validation Tests ---"
+echo "--- Starting Cross-Format Validation Suite ---"
 
-# 1. Suspicious: Blacklisted Name
-run_test "Suspicious (Name)" '{"payerName":"Mark Imaginary", "payeeName":"John Doe", "amount":50, "payerCountryCode":"DEU"}' "REJECTED"
+# --- XML Tests ---
+run_test "Suspicious (XML)" "application/xml" '<payment><transactionId>X1</transactionId><payerName>Mark Imaginary</payerName></payment>' "REJECTED"
+run_test "Standard (XML)" "application/xml" '<payment><transactionId>X2</transactionId><payerName>John Doe</payerName></payment>' "APPROVED"
 
-# 2. Suspicious: Blacklisted Country
-run_test "Suspicious (Country)" '{"payerName":"John Doe", "payeeName":"Jane Smith", "amount":50, "payerCountryCode":"CUB"}' "REJECTED"
-
-# 3. High-risk Review (External Engine)
-run_test "High-risk threshold" '{"payerName":"Alice Smith", "payeeName":"John Doe", "amount":500, "payerCountryCode":"DEU"}' "APPROVED"
-
-# 4. Approved: Standard Payment (Internal Check)
-run_test "Approved (Standard)" '{"payerName":"Alice Smith", "payeeName":"John Doe", "amount":50, "payerCountryCode":"DEU"}' "APPROVED"
+# --- JSON Tests ---
+# Note: Ensure your app handles JSON now if you plan to use this
+run_test "Suspicious (JSON)" "application/json" '{"transactionId":"J1", "payerName":"Mark Imaginary"}' "REJECTED"
+run_test "Standard (JSON)" "application/json" '{"transactionId":"J2", "payerName":"John Doe"}' "APPROVED"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
-
-# Exit with code for the refresh_and_test.sh script to catch
 if [ $FAIL -eq 0 ]; then exit 0; else exit 1; fi

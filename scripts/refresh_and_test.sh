@@ -1,45 +1,38 @@
 #!/bin/bash
 
-# Fraud Check System: Build, Refresh, and Test Automation
+# Fraud Check System: Build, Refresh, and Orchestrate
 # Path: scripts/refresh_and_test.sh
 
 # 1. Navigate to project root
 cd "$(dirname "$0")/.."
 
-echo "--- 1. Cleaning and Compiling Project ---"
-mvn clean compile
+echo -e "\033[1;36m--- Orchestrating System Refresh ---\033[0m"
+
+# 2. Cleanup existing container
+echo "Stopping and removing existing container..."
+docker stop brave_driscoll 2>/dev/null; docker rm brave_driscoll 2>/dev/null
+
+# 3. Clean and Build
+echo "Building project with Maven..."
+mvn clean package -DskipTests
 
 if [ $? -ne 0 ]; then
-    echo "❌ Build failed. Please check your code for syntax errors."
+    echo "❌ Build failed. Please check your code."
     exit 1
 fi
 
-echo "--- 2. Checking if App is running on port 8080 ---"
-# Check if 8080 is occupied
-if ! netstat -tuln | grep -q ":8080 "; then
-    echo "❌ ERROR: App is not running on 8080. Start it in another tab with:"
-    echo '   mvn exec:java -Dexec.mainClass="com.bank.Main"'
-    exit 1
-fi
+# 4. Build and Run Docker Container
+echo "Rebuilding Docker image..."
+docker build -t bank-fraud-poc:latest . > /dev/null
 
-echo "--- 3. Running Validation Suite ---"
-# Ensure validate.sh is executable
-chmod +x ./scripts/validate.sh
+echo "Starting container: brave_driscoll..."
+docker run -d --name brave_driscoll -p 8080:8080 bank-fraud-poc:latest
 
-# Capture the current timestamp
-TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+# 5. Initialize Background Audit Log Engine
+echo "Initializing Audit Log Engine..."
+> transaction_history.log
+docker logs -f brave_driscoll | grep -E "AUDIT_TRACE|REJECTED|APPROVED" >> transaction_history.log &
 
-# Execute validation and log the results
-./scripts/validate.sh > build_report.log 2>&1
-
-# Provide feedback and update history
-if [ $? -eq 0 ]; then
-    echo "✅ Validation successful. See build_report.log for details."
-    echo "[$TIMESTAMP] BUILD & TEST SUCCESS" >> build_history.log
-else
-    echo "❌ Validation failed. Check build_report.log for details."
-    echo "[$TIMESTAMP] BUILD & TEST FAILED" >> build_history.log
-fi
-
-# Optional: Display the results in the terminal
-cat build_report.log
+echo -e "\n\033[1;92m==========================================="
+echo -e "SYSTEM REFRESHED AND READY FOR DEMO"
+echo -e "===========================================\033[0m"

@@ -23,11 +23,10 @@ TECHNOLOGIES=(
 for TECH in "${TECHNOLOGIES[@]}"; do
     echo "✅ $TECH"
 done
-echo "✅ All required technologies and validation pillars verified."
 
 # 2. Check for System Dependencies
 echo -e "\n--- Verifying System Dependencies ---"
-for CMD in mvn curl netstat; do
+for CMD in mvn curl ss lsof; do
     if ! command -v $CMD &> /dev/null; then
         echo "❌ ERROR: $CMD is not installed."
         exit 1
@@ -37,43 +36,41 @@ done
 
 # 3. Integrity Check: Verify all PoC testing tools
 echo -e "\n--- Verifying Integrity of PoC Testing Tools ---"
-
-# Validate validate.sh
-if [ ! -f "scripts/validate.sh" ]; then echo "❌ ERROR: scripts/validate.sh not found."; exit 1; fi
-chmod +x scripts/validate.sh
-echo -e "✅ Verified tool: scripts/validate.sh\n   [Purpose: Automated Audit Suite for regression testing of all business rules.]"
-
-# Validate manual_test.sh
-if [ ! -f "scripts/manual_test.sh" ]; then echo "❌ ERROR: scripts/manual_test.sh not found."; exit 1; fi
-chmod +x scripts/manual_test.sh
-echo -e "✅ Verified tool: scripts/manual_test.sh\n   [Purpose: Diagnostic Debugging Suite for granular request/response inspection.]"
-
-# Validate refresh_and_test.sh
-if [ ! -f "scripts/refresh_and_test.sh" ]; then echo "❌ ERROR: scripts/refresh_and_test.sh not found."; exit 1; fi
-chmod +x scripts/refresh_and_test.sh
-echo -e "✅ Verified tool: scripts/refresh_and_test.sh\n   [Purpose: Orchestration Pipeline for automated build, deployment, and verification.]"
-
-echo -e "\n✅ All PoC tools are present and executable."
+for TOOL in scripts/validate.sh scripts/manual_test.sh scripts/refresh_and_test.sh; do
+    if [ ! -f "$TOOL" ]; then
+        echo "❌ ERROR: $TOOL not found."
+        exit 1
+    fi
+    chmod +x "$TOOL"
+    echo "✅ Verified tool: $TOOL"
+done
 
 # 4. Check if App is running on port 8080
-if ! (ss -tuln | grep -q ":8080 " || netstat -tuln | grep -q ":8080 " || lsof -i :8080 -t > /dev/null 2>&1); then
+if ! (ss -tuln | grep -q ":8080 " || lsof -i :8080 -t > /dev/null 2>&1); then
     echo -e "\n❌ ERROR: Service not found on port 8080."
-    echo "   Start it first with: java -jar target/payment-fraud-poc-1.0-SNAPSHOT.jar"
+    echo "   Start it first with: ./scripts/refresh_and_test.sh"
     exit 1
 fi
-echo -e "\n✅ Service found on port 8080."
+echo "✅ Service found on port 8080."
 
-# 5. Logic Smoke Test
-echo -e "\nRunning logic smoke test (Validating Standard Approval)..."
-RESULT=$(curl -s -m 5 -X POST http://localhost:8080/api/v1/payment-fast \
-  --header "Content-Type: application/json" \
-  --data '{"payerName":"John Doe", "payeeName":"Jane Smith", "amount":50, "payerCountryCode":"DEU"}')
+# 5. Check Audit Log Engine Status
+if [ -f "transaction_history.log" ]; then
+    echo "✅ Audit log engine active (transaction_history.log found)."
+else
+    echo -e "\033[1;33m⚠️ WARNING: Audit log file not found. Run ./scripts/refresh_and_test.sh to initialize.\033[0m"
+fi
+
+# 6. Logic Smoke Test
+echo -e "\nRunning logic smoke test..."
+RESULT=$(curl -s -m 5 -X POST http://localhost:8080/api/payment \
+  -H "Content-Type: application/xml" \
+  -d '<payment><transactionId>SYNC-OK-001</transactionId><payerName>John Smith</payerName><payeeName>John Doe</payeeName></payment>')
 
 if [[ "$RESULT" == *"APPROVED"* ]]; then
-    echo -e "\033[1;92m==========================================="
+    echo -e "\n\033[1;92m==========================================="
     echo -e "SYSTEM IS READY FOR REVIEW"
     echo -e "===========================================\033[0m"
 else
-    echo -e "\033[1;31mSmoke test failed: Service returned unexpected body: $RESULT\033[0m"
+    echo -e "\033[1;31mSmoke test failed: Service returned unexpected output: $RESULT\033[0m"
     exit 1
 fi
