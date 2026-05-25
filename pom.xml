@@ -84,6 +84,34 @@
             <artifactId>camel-bean</artifactId>
             <version>4.8.3</version>
         </dependency>
+        <dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-xpath</artifactId>
+    <version>4.8.3</version>
+    </dependency>
+    <dependency>
+    <groupId>org.apache.camel</groupId>
+    <artifactId>camel-direct</artifactId>
+    <version>4.8.3</version>
+</dependency>
+<dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <version>1.18.30</version>
+        <scope>provided</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.glassfish.jaxb</groupId>
+        <artifactId>jaxb-runtime</artifactId>
+        <version>4.0.4</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.camel</groupId>
+        <artifactId>camel-core</artifactId>
+        <version>4.8.3</version>
+    </dependency>
+
+
     </dependencies>
 
     <build>
