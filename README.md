@@ -1,583 +1,487 @@
 # Bank Payment Fraud Detection PoC
 
-> A modular, enterprise-grade fraud screening engine built with **Apache Camel**, **Java 17**, and **Google Cloud Run**.  
-> Demonstrates both synchronous (REST) and asynchronous (JMS) communication models as required by the coding exercise.
+> **Java 17 · Apache Camel 4.8 · ActiveMQ 6 · JMS + REST · Enterprise Integration Patterns**
+
+---
+
+## PoC Objective
+
+This PoC mocks and demonstrates a secure, decoupled payment fraud screening workflow across three systems:
+
+| System | Role |
+|---|---|
+| **PPS** — Payment Processing System | Receives JSON payments, validates all fields, invokes BS, processes result |
+| **BS** — Broker System | Insulates PPS from FCS — converts JSON↔XML, routes via JMS |
+| **FCS** — Fraud Check System | Receives XML from BS, applies blacklist rules, returns XML result |
+
+### Two Solutions Required
+
+| | PPS ↔ BS | BS ↔ FCS |
+|---|---|---|
+| **Solution 1** | Messaging (JMS) + **JSON** | Messaging (JMS) + **XML** |
+| **Solution 2** | REST API + **JSON** | Messaging (JMS) + **XML** |
+
+> **PPS always communicates in JSON only.**
+> XML is only used on the BS ↔ FCS leg.
+> The BS is responsible for all JSON↔XML translation.
+
+### System Responsibilities (from exercise spec)
+
+**PPS — Payment Processing System**
+1. Receives a payment **in JSON** for processing
+2. Performs basic validation — valid ISO country code, valid ISO currency code, UUID, amount, date
+3. Invokes the Broker System (BS) for a fraud check
+4. Processes the payment after the fraud check based on approval or rejection from BS
+
+**BS — Broker System**
+1. Receives fraud check request **in JSON** from PPS — converts to XML
+2. Sends payment **in XML** to FCS for fraud check
+3. Receives fraud check result **in XML** from FCS
+4. Converts result to **JSON** and sends it back to PPS
+
+**FCS — Fraud Check System**
+1. Receives fraud check request **in XML** from BS
+2. Checks payer and payee details (name, country, bank) and payment instruction
+3. Approves or rejects the payment
+4. Sends the fraud check result **in XML** back to BS
 
 ---
 
 ## Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [Repository Structure](#2-repository-structure)
-3. [Architecture & Component Design](#3-architecture--component-design)
-4. [UML — System Workflow](#4-uml--system-workflow)
-5. [Payment Payload](#5-payment-payload)
-6. [Fraud Validation Rules](#6-fraud-validation-rules)
-7. [Fraud Responses](#7-fraud-responses)
-8. [Validation & Testing](#8-validation--testing)
-9. [Audit & Observability](#9-audit--observability)
+1. [Integration Solutions](#1-integration-solutions)
+2. [UML Component Diagram](#2-uml-component-diagram)
+3. [UML Sequence Diagram — Solution 1 (JMS)](#3-uml-sequence-diagram--solution-1-jms)
+4. [UML Sequence Diagram — Solution 2 (REST)](#4-uml-sequence-diagram--solution-2-rest)
+5. [Class Diagram — Core Components](#5-class-diagram--core-components)
+6. [Payment Payload](#6-payment-payload)
+7. [Fraud Rules](#7-fraud-rules)
+8. [Project Structure](#8-project-structure)
+9. [Tech Stack](#9-tech-stack)
 10. [Build & Run](#10-build--run)
-11. [Setup & Validation Steps](#11-setup--validation-steps)
-12. [Deployment](#12-deployment)
-13. [Tech Stack](#13-tech-stack)
-14. [Demo Expectations](#14-demo-expectations)
-15. [Roadmap / Remaining Tasks](#15-roadmap--remaining-tasks)
+11. [Validate Each Requirement](#11-validate-each-requirement)
+12. [Camel EIP Patterns Used](#12-camel-eip-patterns-used)
+13. [Final Status Report](#13-final-status-report)
 
 ---
 
-## 1. Project Overview
+## 1. Integration Solutions
 
-This Proof of Concept (PoC) simulates a banking payment fraud screening architecture. The system validates payment requests, performs blacklist-based fraud checks across three decoupled systems, and maintains full auditability of every transaction — with end-to-end correlation ID tracing.
+### Solution 1 — JMS Messaging Flow
 
-The three systems are:
+```
+Client → POST /api/v1/payments/secure  (JSON)
+  PPS: validate JSON → Wire Tap audit → publish JSON to jms:ppsToBS
+  PPS → Client: 202 ACCEPTED_FOR_PROCESSING  (immediate)
 
-- **Payment Processing System (PPS)** — receives, validates, and processes payments
-- **Broker System (BS)** — translates between JSON and XML; routes between PPS and FCS
-- **Fraud Check System (FCS)** — applies blacklist rules and returns approve/reject decisions
+  BS:  consume JSON from ppsToBS
+  BS:  JSON → XML  (Message Translator / JAXB)
+  BS:  publish XML to jms:bsToFCS
 
-### Integration Patterns
+  FCS: consume XML from bsToFCS
+  FCS: run all 4 blacklist checks
+  FCS: publish XML result to jms:fcsToBS
 
-**Solution 1 — Messaging (JMS)**
+  BS:  consume XML from fcsToBS
+  BS:  XML → JSON  (Message Translator)
+  BS:  Wire Tap audit → publish JSON to jms:bsToPPS
 
-```text
-PPS → JSON/JMS → BS → XML/JMS → FCS → XML/JMS → BS → JSON/JMS → PPS
+  PPS: consume JSON from bsToPPS
+  PPS: store APPROVED / REJECTED → Wire Tap audit
+
+Client → GET /api/v1/payments/{transactionId}/status → APPROVED / REJECTED
 ```
 
-**Solution 2 — REST API**
+### Solution 2 — REST API Flow
 
-```text
-PPS → REST/JSON → BS → XML/JMS → FCS → XML/JMS → BS → JSON/REST → PPS
 ```
+Client → POST /api/v1/payments  (JSON)
+  PPS: validate JSON → Wire Tap audit
 
-> In both solutions: BS ↔ FCS always uses **XML over JMS**.  
-> Audit logging and correlation IDs are mandatory in both solutions.
+  BS:  JSON → XML  (Message Translator, via direct: route)
 
----
+  FCS: run all 4 blacklist checks → XML result
 
-## 2. Repository Structure
+  BS:  XML → JSON  (Message Translator)
+  BS:  Wire Tap audit
 
-```text
-bank-payment-fraud-poc/
-│
-├── pom.xml                          # Maven build — Java 17, Camel 3.20, Netty HTTP
-├── Dockerfile                       # Multi-stage build: maven:3.8 → temurin:17-jre
-├── service.yaml                     # Knative / Google Cloud Run deployment spec
-├── README.md                        # This file
-│
-└── src/
-    └── main/
-        ├── java/
-        │   └── com/bank/
-        │       └── PaymentApp.java   # Entry point — Camel Main + route definitions
-        │
-        └── resources/
-            ├── application.properties  # MDC logging config (correlationId tracking)
-            └── logback.xml             # Structured log pattern with correlationId
+  PPS → Client: 200 APPROVED | 400 validation error | 403 REJECTED  (JSON)
 ```
 
 ---
 
-### `pom.xml` — Project Build Definition
+## 2. UML Component Diagram
 
-Maven configuration file that defines the entire build.
-
-> **Why it's used:** Declares all dependencies and produces a self-contained **fat JAR** via `maven-shade-plugin` — runnable anywhere with just `java -jar`, no separate app server needed.
-
-**Key highlights:**
-- 📦 Bundles `camel-core`, `camel-main`, `camel-netty-http`, `logback-classic` into one deployable artifact
-- 📌 Pins **Java 17** and **Camel 4.8.3** for consistent builds across machines and CI/CD pipelines
-- 🏗️ `maven-shade-plugin` merges all dependencies into a single ~20MB fat JAR
-
----
-
-### `PaymentApp.java` — The Entire Application
-
-Single entry point for the service — route definition, validation logic, and response all in one file.
-
-> **Why it's used:** Keeps the full request lifecycle visible end-to-end without jumping between files. Ideal for a PoC; in production this would be split into separate route builders, validators, and processors.
-
-**Key highlights:**
-- 🚀 Starts the **Apache Camel** runtime via `CamelMain`
-- 🔌 Defines the **Netty-HTTP route** listening on `POST /api/payment`
-- 🔍 Parses the incoming XML payload and extracts `<amount>`
-- ⚖️ Applies fraud threshold logic: `amount > 5000 → REVIEW_REQUIRED`, else `APPROVED`
-- 📤 Returns a structured XML response for every outcome (`APPROVED`, `REVIEW_REQUIRED`, `INVALID_REQUEST`, `ERROR_PARSING`)
-
----
-
-### `application.properties` — MDC Logging Configuration
-
-Enables correlation ID propagation across all log lines.
-
-> **Why it's used:** Makes every log line for a given request carry the same `correlationId`, so a single transaction can be traced through the full system — a **mandatory audit requirement** of this exercise.
-
-**Key highlights:**
-- 🔗 Activates `camel.main.useMdcLogging=true`
-- 🏷️ Registers `correlationId` as a tracked MDC key via `camel.main.mdcLoggingKeysPattern`
-- 🤝 Works in tandem with `logback.xml` — this file tells Camel to *track* the ID; Logback prints it
-
----
-
-### `logback.xml` — Log Format Definition
-
-Defines the exact structure of every log line printed to the console.
-
-> **Why it's used:** Without this file, the `correlationId` configured in `application.properties` would never actually appear in output. The two files are tightly coupled by design.
-
-**Key highlights:**
-- 🕐 Includes timestamp, thread name, log level, and logger name in every line
-- 🆔 Injects `[%X{correlationId}]` so audit trails are always traceable
-- 📋 Console appender format mirrors what appears in **Google Cloud Logs Explorer**
-
----
-
-### `Dockerfile` — Container Build
-
-Multi-stage Docker build that produces a lean, production-ready image.
-
-> **Why it's used:** Separates the build environment from the runtime environment — the final image contains only the JRE and the JAR, not Maven or source code, keeping image size minimal.
-
-**Key highlights:**
-- 🏗️ **Stage 1** (`maven:3.8`) — compiles source and produces the fat JAR
-- 🚢 **Stage 2** (`eclipse-temurin:17-jre`) — copies only the JAR into a lightweight runtime image
-- 🔒 No source code or build tools leak into the production container
-- 🌐 Exposes port `8080` for the Netty-HTTP listener
-
----
-
-### `service.yaml` — Cloud Run Deployment Spec
-
-Knative service definition used to deploy and configure the service on Google Cloud Run.
-
-> **Why it's used:** Provides a declarative, repeatable deployment config — one `gcloud run services replace service.yaml` command redeploys the entire service with all resource limits and scaling rules applied consistently.
-
-**Key highlights:**
-- 🌍 Deployed to `europe-west3` (Frankfurt) for low-latency EU access
-- ⚙️ Resource limits: `1 CPU / 1 Gi RAM` per container instance
-- 📈 Auto-scales up to **3 replicas** under load; scales to zero when idle
-- ⏱️ **300-second timeout** accommodates long-running fraud check flows
-- 🔁 **80 concurrent requests** per container before a new instance is spawned
-- 🩺 TCP startup probe on `:8080` with 30s delay and 24 retries ensures Camel is fully ready before traffic is routed
-
----
-
-### File Responsibilities Summary
-
-| File | Purpose |
-|---|---|
-| `PaymentApp.java` | Main Apache Camel application — defines Netty-HTTP route, fraud threshold logic, XML response |
-| `application.properties` | Enables MDC logging; propagates `correlationId` through all log lines |
-| `logback.xml` | Console appender with timestamp, thread, level, `correlationId`, and logger |
-| `Dockerfile` | Stage 1: compile with Maven. Stage 2: run with lightweight JRE. Exposes port 8080 |
-| `pom.xml` | Declares `camel-core`, `camel-main`, `camel-netty-http`, `logback-classic`; fat JAR via `maven-shade-plugin` |
-| `service.yaml` | Cloud Run spec: `europe-west3`, max 3 replicas, 1 CPU / 1 Gi RAM, 300s timeout |
-
----
-
-## 3. Architecture & Component Design
-
-The fraud engine is fully decoupled from the transport layer — switching between REST and JMS requires no changes to fraud logic.
-
-### System Overview
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                Payment Processing System (PPS)           │
-│  Receives payment → Validates → Calls BS for fraud check │
-└───────────────────────┬─────────────────────────────────┘
-                        │ JSON  (Solution 1: JMS · Solution 2: REST)
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│                    Broker System (BS)                    │
-│   Converts JSON ↔ XML · Routes between PPS and FCS       │
-└───────────────────────┬─────────────────────────────────┘
-                        │ XML / JMS  (both solutions)
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│               Fraud Check System (FCS)                   │
-│  Applies blacklist rules · Returns APPROVED / REJECTED   │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Mermaid Component Diagram
+> Format rules from exercise spec:
+> - Client → PPS: **JSON only**
+> - PPS ↔ BS: **JSON** (JMS in Sol1, REST in Sol2)
+> - BS ↔ FCS: **XML over JMS** (both solutions)
 
 ```mermaid
 flowchart LR
-    Client[Payment Client]
 
-    subgraph PPS [Payment Processing System]
-        PPS1[Receive Payment JSON]
-        PPS2[Validate Payment Payload]
-        PPS3[Invoke Broker System]
-        PPS4[Process Fraud Response]
+    Client["Client\n(Payment Channel)"]
+
+    subgraph PPS["Payment Processing System (PPS)"]
+        SyncAPI["REST Sync API\nPOST /api/v1/payments\nJSON in · JSON out"]
+        AsyncAPI["REST Async API\nPOST /api/v1/payments/secure\nJSON in · 202 out"]
+        StatusAPI["Status Poll\nGET /api/v1/payments/{id}/status"]
+        Validator["Payment Validator\n13 mandatory fields\nISO country · ISO currency\nUUID · amount · date"]
+        StatusStore["Status Store\ntransactionId → APPROVED/REJECTED"]
+        AuditPPS["Audit Logger\nWire Tap"]
     end
 
-    subgraph BS [Broker System]
-        BS1[Receive Fraud Request JSON]
-        BS2[Transform JSON to XML]
-        BS3[Send XML Fraud Request]
-        BS4[Receive XML Fraud Response]
-        BS5[Transform XML to JSON]
-        BS6[Return Fraud Response]
+    subgraph BS["Broker System (BS) — Apache Camel\nInsulates PPS from FCS"]
+        TranslatorJX["JSON → XML\nMessage Translator\nPaymentDTO via JAXB"]
+        TranslatorXJ["XML → JSON\nMessage Translator\nfraudResult → JSON"]
+        AuditBS["Audit Logger\nWire Tap"]
     end
 
-    subgraph FCS [Fraud Check System]
-        FCS1[Receive XML Request]
-        FCS2[Check Name Blacklist]
-        FCS3[Check Country Blacklist]
-        FCS4[Check Bank Blacklist]
-        FCS5[Check Payment Instruction]
-        FCS6[Approve / Reject]
+    subgraph FCS["Fraud Check System (FCS)"]
+        FraudEngine["Blacklist Fraud Engine\nname · country · bank · instruction\npayer AND payee checked"]
+        FraudDecision["Fraud Decision\nAPPROVED: Nothing found, all okay\nREJECTED: Suspicious payment"]
     end
 
-    Client --> PPS1
-    PPS1 --> PPS2
-    PPS2 --> PPS3
+    subgraph MQ["ActiveMQ — Embedded JMS Broker"]
+        Q1["ppsToBS\nJSON"]
+        Q2["bsToFCS\nXML"]
+        Q3["fcsToBS\nXML"]
+        Q4["bsToPPS\nJSON"]
+        Q5["auditQueue"]
+    end
 
-    PPS3 -->|"Solution 1: JSON/JMS"| BS1
-    PPS3 -->|"Solution 2: REST/JSON"| BS1
+    Client -->|"JSON"| SyncAPI
+    Client -->|"JSON"| AsyncAPI
+    Client --> StatusAPI
 
-    BS1 --> BS2 --> BS3
-    BS3 -->|"XML/JMS"| FCS1
+    SyncAPI --> Validator
+    AsyncAPI --> Validator
+    StatusAPI --> StatusStore
 
-    FCS1 --> FCS2 --> FCS3 --> FCS4 --> FCS5 --> FCS6
+    Validator -.->|"Wire Tap"| AuditPPS
+    AuditPPS -.->|"async"| Q5
 
-    FCS6 --> BS4 --> BS5 --> BS6
-    BS6 --> PPS4
-```
+    AsyncAPI -->|"Sol1: JSON"| Q1
+    Q1 -->|"JSON"| TranslatorJX
+    TranslatorJX -->|"XML"| Q2
+    Q2 -->|"XML"| FraudEngine
+    FraudEngine --> FraudDecision
+    FraudDecision -->|"XML"| Q3
+    Q3 -->|"XML"| TranslatorXJ
+    TranslatorXJ -.->|"Wire Tap"| AuditBS
+    AuditBS -.->|"async"| Q5
+    TranslatorXJ -->|"JSON"| Q4
+    Q4 -->|"JSON"| StatusStore
 
-### Apache Camel Route (current implementation)
-
-```
-from("netty-http:http://0.0.0.0:8080/api/payment")
-  └─► Read InputStream → String body
-  └─► Parse <amount> tag from XML payload
-  └─► amount > 5000  →  status = REVIEW_REQUIRED
-  └─► amount ≤ 5000  →  status = APPROVED
-  └─► error parsing  →  status = ERROR_PARSING
-  └─► no <amount>    →  status = INVALID_REQUEST
-  └─► Return XML: <response><status>{status}</status></response>
+    SyncAPI -->|"Sol2: JSON via direct:"| TranslatorJX
+    TranslatorXJ -->|"Sol2: JSON response"| SyncAPI
 ```
 
 ---
 
-## 4. UML — System Workflow
+## 3. UML Sequence Diagram — Solution 1 (JMS)
 
-### Sequence Diagram — Solution 2 (REST)
+> PPS ↔ BS: **JSON over JMS**
+> BS ↔ FCS: **XML over JMS**
 
-```
-Client          PPS                    BS                     FCS
-  │              │                      │                       │
-  │  POST /api/payment (JSON)           │                       │
-  │─────────────►│                      │                       │
-  │              │  validate payload    │                       │
-  │              │──────────────┐       │                       │
-  │              │◄─────────────┘       │                       │
-  │              │                      │                       │
-  │              │  POST /fraud-check (JSON)                    │
-  │              │─────────────────────►│                       │
-  │              │                      │  convert JSON → XML   │
-  │              │                      │──────────────────────►│
-  │              │                      │                       │  check blacklists
-  │              │                      │                       │──────────────┐
-  │              │                      │                       │◄─────────────┘
-  │              │                      │◄─── XML result ───────│
-  │              │                      │  convert XML → JSON   │
-  │              │◄─── JSON result ─────│                       │
-  │◄─── response ┤                      │                       │
-  │  APPROVED or │                      │                       │
-  │  REJECTED    │                      │                       │
-```
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant PPS
+    participant Q_ppsToBS   as "ppsToBS (JSON)"
+    participant BS
+    participant Q_bsToFCS   as "bsToFCS (XML)"
+    participant FCS
+    participant Q_fcsToBS   as "fcsToBS (XML)"
+    participant Q_bsToPPS   as "bsToPPS (JSON)"
+    participant StatusStore as "PPS: StatusStore"
+    participant Audit       as "auditQueue"
 
-### Sequence Diagram — Solution 1 (JMS Messaging)
+    Client->>PPS: POST /api/v1/payments/secure (JSON)
+    PPS->>PPS: Validate JSON — 13 fields, UUID, ISO codes, amount, date
+    PPS-->>Audit: WireTap — async audit (JSON)
+    PPS->>Q_ppsToBS: Publish JSON payment — Fire-and-Forget (InOnly)
+    PPS-->>Client: 202 ACCEPTED_FOR_PROCESSING (JSON, immediate)
 
-```
-Client          PPS              ActiveMQ              BS               FCS
-  │              │                   │                  │                │
-  │  POST /api/payment (JSON)        │                  │                │
-  │─────────────►│                   │                  │                │
-  │              │  validate         │                  │                │
-  │              │  publish JSON ───►│                  │                │
-  │              │                   │─── JSON msg ────►│                │
-  │              │                   │                  │  convert → XML │
-  │              │                   │                  │───────────────►│
-  │              │                   │                  │                │  blacklist check
-  │              │                   │                  │◄─── XML result─│
-  │              │                   │                  │  convert → JSON│
-  │              │                   │◄── JSON result ──│                │
-  │              │◄── JSON msg ──────│                  │                │
-  │◄─── response─┤                   │                  │                │
+    note over Q_ppsToBS,BS: PPS to BS — JSON over JMS
+
+    Q_ppsToBS->>BS: Consume JSON payment
+    BS->>BS: JSON to XML — Message Translator (JAXB marshal)
+
+    note over BS,Q_bsToFCS: BS to FCS — XML over JMS
+
+    BS->>Q_bsToFCS: Publish XML payment
+
+    Q_bsToFCS->>FCS: Consume XML fraud request
+    FCS->>FCS: Check name blacklist — payer and payee
+    FCS->>FCS: Check country blacklist — payer and payee
+    FCS->>FCS: Check bank blacklist — payer and payee
+    FCS->>FCS: Check payment instruction blacklist
+
+    note over FCS,Q_fcsToBS: FCS to BS — XML over JMS
+
+    FCS->>Q_fcsToBS: Publish XML result (APPROVED or REJECTED)
+
+    Q_fcsToBS->>BS: Consume XML result
+    BS->>BS: XML to JSON — Message Translator
+
+    note over BS,Q_bsToPPS: BS to PPS — JSON over JMS
+
+    BS-->>Audit: WireTap — async audit (JSON result)
+    BS->>Q_bsToPPS: Publish JSON result
+
+    Q_bsToPPS->>PPS: Consume JSON result
+    PPS->>StatusStore: Store APPROVED or REJECTED by transactionId
+    PPS-->>Audit: WireTap — final audit
+
+    Client->>PPS: GET /api/v1/payments/{transactionId}/status
+    PPS->>StatusStore: Look up transactionId
+    PPS-->>Client: 200 OK — APPROVED or REJECTED (JSON)
 ```
 
 ---
 
-## 5. Payment Payload
+## 4. UML Sequence Diagram — Solution 2 (REST)
 
-### JSON Request (POST `/api/payment`)
+> PPS ↔ BS: **JSON over REST** (via Camel direct: route)
+> BS ↔ FCS: **XML over JMS** (same as Solution 1)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant PPS
+    participant BS
+    participant Q_bsToFCS as "bsToFCS (XML)"
+    participant FCS
+    participant Q_fcsToBS as "fcsToBS (XML)"
+    participant Audit     as "auditQueue"
+
+    Client->>PPS: POST /api/v1/payments (JSON)
+    PPS->>PPS: Validate JSON — 13 fields, UUID, ISO codes, amount, date
+
+    alt Validation fails
+        PPS-->>Audit: WireTap — async audit (JSON)
+        PPS-->>Client: 400 Bad Request (JSON) — REJECTED + reason
+    else Validation passes
+        PPS-->>Audit: WireTap — async audit (JSON)
+
+        note over PPS,BS: PPS to BS — JSON via REST (direct: route)
+
+        PPS->>BS: Forward JSON payment via direct:bs-sync
+        BS->>BS: JSON to XML — Message Translator (JAXB marshal)
+
+        note over BS,Q_bsToFCS: BS to FCS — XML over JMS (InOut)
+
+        BS->>Q_bsToFCS: Publish XML payment (InOut — request/reply)
+
+        Q_bsToFCS->>FCS: Consume XML fraud request
+        FCS->>FCS: Check name blacklist — payer and payee
+        FCS->>FCS: Check country blacklist — payer and payee
+        FCS->>FCS: Check bank blacklist — payer and payee
+        FCS->>FCS: Check payment instruction blacklist
+
+        note over FCS,Q_fcsToBS: FCS to BS — XML over JMS
+
+        FCS->>Q_fcsToBS: Return XML result (APPROVED or REJECTED)
+
+        Q_fcsToBS->>BS: Receive XML result (JMS reply)
+        BS->>BS: XML to JSON — Message Translator
+
+        note over BS,PPS: BS to PPS — JSON via REST response
+
+        BS-->>Audit: WireTap — async audit (JSON result)
+        BS->>PPS: Return JSON fraud result
+
+        alt APPROVED
+            PPS-->>Client: 200 OK — APPROVED (JSON) — Nothing found, all okay
+        else REJECTED
+            PPS-->>Client: 403 Forbidden — REJECTED (JSON) — Suspicious payment
+        end
+    end
+```
+
+---
+
+## 5. Class Diagram — Core Components
+
+```mermaid
+classDiagram
+
+    class PaymentDTO {
+        +String transactionId
+        +String payerName
+        +String payerBank
+        +String payerCountryCode
+        +String payerAccount
+        +String payeeName
+        +String payeeBank
+        +String payeeCountryCode
+        +String payeeAccount
+        +String paymentInstruction
+        +String executionDate
+        +String amount
+        +String currency
+        +String creationTimestamp
+        +getters()
+        +setters()
+    }
+
+    class PaymentValidator {
+        -ISO_ALPHA3_COUNTRIES: Set~String~
+        +validate(dto: PaymentDTO): PaymentDTO
+        -require(value, field): void
+        -validateUUID(uuid): void
+        -validateCountry(code, field): void
+        -validateCurrency(code): void
+        -validateAmount(amount): void
+        -validateDate(date): void
+        -validateTimestamp(ts): void
+    }
+
+    class PaymentApp {
+        <<RouteBuilder>>
+        -STATUS_STORE: ConcurrentHashMap
+        +configure(): void
+        -pps-sync: seda consumer
+        -pps-async: seda consumer
+        -bs-sync: direct consumer
+        -bs-async: jms:ppsToBS consumer
+        -fcs-fraud-engine: jms:bsToFCS consumer
+        -bs-result: jms:fcsToBS consumer
+        -pps-final: jms:bsToPPS consumer
+        -audit-logger: jms:auditQueue consumer
+        -isBlacklisted(value, blacklist): boolean
+        -extractTag(xml, tag): String
+    }
+
+    class BankApplication {
+        +main(args: String[]): void
+    }
+
+    BankApplication --> PaymentApp : starts
+    PaymentApp --> PaymentValidator : bean validate
+    PaymentApp --> PaymentDTO : marshal unmarshal
+    PaymentValidator ..> PaymentDTO : validates
+```
+
+---
+
+## 6. Payment Payload
+
+> **PPS accepts JSON only.** BS converts JSON to XML internally before sending to FCS.
+> The XML format below is never exposed to the client.
+
+### JSON Request — Client to PPS
 
 ```json
 {
-  "transactionId": "123e4567-e89b-12d3-a456-426614174000",
-  "payerName": "Munster Muller",
-  "payerBank": "Bank of America",
-  "payerCountryCode": "USA",
-  "payerAccount": "123456789",
-  "payeeName": "John Smith",
-  "payeeBank": "BNP Paribas",
-  "payeeCountryCode": "FRA",
-  "payeeAccount": "987654321",
-  "paymentInstruction": "Loan Repayment",
-  "executionDate": "2025-12-10",
-  "amount": 2500.50,
-  "currency": "USD",
-  "creationTimestamp": "2025-12-10T10:15:30Z"
+  "transactionId":      "550e8400-e29b-41d4-a716-446655440000",
+  "payerName":          "John Smith",
+  "payerBank":          "Bank of America",
+  "payerCountryCode":   "GBR",
+  "payerAccount":       "123456789",
+  "payeeName":          "Jane Doe",
+  "payeeBank":          "BNP Paribas",
+  "payeeCountryCode":   "DEU",
+  "payeeAccount":       "987654321",
+  "paymentInstruction": "Salary",
+  "executionDate":      "2025-05-22",
+  "amount":             "1500.00",
+  "currency":           "EUR",
+  "creationTimestamp":  "2025-05-22T09:00:00Z"
 }
 ```
 
-### XML Request (current implementation — sent to `/api/payment`)
+### XML Format — BS to FCS (internal only, not exposed to client)
 
 ```xml
 <payment>
   <transactionId>550e8400-e29b-41d4-a716-446655440000</transactionId>
   <payerName>John Smith</payerName>
-  <payerCountry>GBR</payerCountry>
-  <payerBank>Barclays</payerBank>
-  <payeeName>Acme Corp</payeeName>
-  <payeeCountry>DEU</payeeCountry>
-  <payeeBank>Deutsche Bank</payeeBank>
-  <amount>1000</amount>
-  <currency>EUR</currency>
-  <paymentInstruction>Invoice payment Q3</paymentInstruction>
+  <payerBank>Bank of America</payerBank>
+  <payerCountryCode>GBR</payerCountryCode>
+  <payerAccount>123456789</payerAccount>
+  <payeeName>Jane Doe</payeeName>
+  <payeeBank>BNP Paribas</payeeBank>
+  <payeeCountryCode>DEU</payeeCountryCode>
+  <payeeAccount>987654321</payeeAccount>
+  <paymentInstruction>Salary</paymentInstruction>
   <executionDate>2025-05-22</executionDate>
+  <amount>1500.00</amount>
+  <currency>EUR</currency>
+  <creationTimestamp>2025-05-22T09:00:00Z</creationTimestamp>
 </payment>
 ```
 
-### Field Validation Rules
+### Validation Rules
 
 | Field | Rule |
 |---|---|
-| `transactionId` | Valid UUID (RFC 4122) |
-| `payerCountryCode` / `payeeCountryCode` | ISO 3166-1 alpha-3 (e.g. `USA`, `GBR`, `DEU`) |
-| `currency` | ISO 4217 code (e.g. `USD`, `EUR`) |
-| `amount` | Positive numeric value |
-| `executionDate` | ISO 8601 date (e.g. `2025-12-10`) |
-| `creationTimestamp` | ISO 8601 UTC timestamp (e.g. `2025-12-10T10:15:30Z`) |
+| `transactionId` | UUID format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
+| `payerCountryCode` / `payeeCountryCode` | ISO 3166-1 alpha-3 (e.g. `GBR`, `DEU`, `USA`) |
+| `currency` | ISO 4217 (e.g. `EUR`, `GBP`, `USD`) |
+| `amount` | Positive, exactly 2 decimal places (e.g. `17.45`) |
+| `executionDate` | ISO 8601: `YYYY-MM-DD` |
+| `creationTimestamp` | ISO 8601 UTC: `YYYY-MM-DDThh:mm:ssZ` |
+| `paymentInstruction` | Optional |
+| All other fields | Mandatory — must not be empty |
 
 ---
 
-## 6. Fraud Validation Rules
+## 7. Fraud Rules
 
-All payments are screened against four blacklists. **Any single match triggers rejection.**
+Any single match on payer **or** payee → **REJECTED** + `"Suspicious payment"`
+No match → **APPROVED** + `"Nothing found, all okay"`
 
-### Name Blacklist
-
-| Blocked Name |
-|---|
-| Mark Imaginary |
-| Govind Real |
-| Shakil Maybe |
-| Chang Imagine |
-
-### Country Blacklist (ISO 3166-1 alpha-3)
-
-| Code | Country |
+| Check | Blacklisted Values |
 |---|---|
-| CUB | Cuba |
-| IRQ | Iraq |
-| IRN | Iran |
-| PRK | North Korea |
-| SDN | Sudan |
-| SYR | Syria |
+| Name (payer + payee) | Mark Imaginary, Govind Real, Shakil Maybe, Chang Imagine |
+| Country (payer + payee) | `CUB`, `IRQ`, `IRN`, `PRK`, `SDN`, `SYR` |
+| Bank (payer + payee) | BANK OF KUNLUN, KARAMAY CITY COMMERCIAL BANK |
+| Payment instruction | Artillery Procurement, Lethal Chemicals payment |
 
-### Bank Blacklist
+---
 
-| Blocked Bank |
-|---|
-| Bank of Kunlun |
-| Karamay City Commercial Bank |
-
-### Payment Instruction Blacklist
-
-| Blocked Instruction |
-|---|
-| Artillery Procurement |
-| Lethal Chemicals payment |
-
-### Decision Logic
+## 8. Project Structure
 
 ```
-IF payer OR payee name    ∈ name blacklist         → REJECTED
-IF payer OR payee country ∈ country blacklist       → REJECTED
-IF payer OR payee bank    ∈ bank blacklist          → REJECTED
-IF paymentInstruction     ∈ instruction blacklist   → REJECTED
-OTHERWISE                                           → APPROVED
+bank-payment-fraud-poc/
+│
+├── pom.xml                                       Maven — Camel 4.8, ActiveMQ 6
+├── Dockerfile                                    Multi-stage: maven:3.9 → temurin:17-jre
+├── README.md                                     This file
+│
+└── src/main/
+    ├── java/com/bank/
+    │   ├── model/
+    │   │   └── PaymentDTO.java                   14-field POJO — JSON (Jackson) + XML (JAXB)
+    │   ├── service/
+    │   │   └── PaymentValidator.java             PPS: all 13 field validations
+    │   ├── BankApplication.java                  Entry point — Camel Main + embedded ActiveMQ
+    │   └── PaymentApp.java                       All Camel routes: PPS + BS + FCS
+    └── resources/
+        ├── application.properties                MDC logging (correlationId)
+        └── logback.xml                           Structured log pattern
 ```
 
 ---
 
-## 7. Fraud Responses
+## 9. Tech Stack
 
-### Approved
-
-```json
-{
-  "status": "APPROVED",
-  "message": "Nothing found, all okay"
-}
-```
-
-### Rejected
-
-```json
-{
-  "status": "REJECTED",
-  "message": "Suspicious payment"
-}
-```
-
-### Current XML Responses (live implementation)
-
-```xml
-<!-- Approved -->
-<response><status>APPROVED</status></response>
-
-<!-- Flagged for review -->
-<response><status>REVIEW_REQUIRED</status></response>
-
-<!-- Missing amount tag -->
-<response><status>INVALID_REQUEST</status></response>
-
-<!-- Parse error -->
-<response><status>ERROR_PARSING</status></response>
-```
-
----
-
-## 8. Validation & Testing
-
-### Functional Test Cases
-
-| Scenario | Input | Expected Status |
+| Technology | Version | Purpose |
 |---|---|---|
-| Standard transaction | amount = 1000 | `APPROVED` |
-| High-risk transaction | amount = 6000 | `REVIEW_REQUIRED` |
-| Exact threshold | amount = 5000 | `APPROVED` |
-| Just over threshold | amount = 5001 | `REVIEW_REQUIRED` |
-| Missing amount tag | _(no `<amount>`)_ | `INVALID_REQUEST` |
-| Non-numeric amount | `abc` | `ERROR_PARSING` |
-| Blocked name | payerName = "Mark Imaginary" | `REJECTED` |
-| Blocked country | payerCountryCode = "IRN" | `REJECTED` |
-| Blocked bank | payerBank = "Bank of Kunlun" | `REJECTED` |
-| Blocked instruction | paymentInstruction = "Artillery Procurement" | `REJECTED` |
-
-### Manual curl Tests
-
-Use these commands to verify your PPS endpoint. Note: Ensure the XML payload is wrapped in double quotes.
-
-```bash
-# Approved — amount within threshold (1000 <= 5000)
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -H "X-Correlation-ID: test-001" \
-  -d "<payment><amount>1000</amount></payment>"
-
-# Review required — amount exceeds threshold (6000 > 5000)
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -H "X-Correlation-ID: test-002" \
-  -d "<payment><amount>6000</amount></payment>"
-
-# Invalid — missing amount tag
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -H "X-Correlation-ID: test-003" \
-  -d "<payment><payer>test</payer></payment>"
-```
-
-### Automated Test Script (Updated)
-
-Save this as `validate.sh` and run `chmod +x validate.sh`.
-
-```bash
-#!/bin/bash
-URL="http://localhost:8080/api/payment"
-PASS=0; FAIL=0
-
-run_test() {
-  local desc="$1" payload="$2" expected="$3"
-  # Use --header for Content-Type to avoid issues with some shells
-  actual=$(curl -s -X POST "$URL" \
-    --header "Content-Type: application/xml" \
-    --header "X-Correlation-ID: auto-test-$$" \
-    --data "$payload")
-
-  if echo "$actual" | grep -q "$expected"; then
-    echo "✅ PASS: $desc"
-    ((PASS++))
-  else
-    echo "❌ FAIL: $desc — expected '$expected', got: $actual"
-    ((FAIL++))
-  fi
-}
-
-run_test "Standard payment"        "<payment><amount>1000</amount></payment>" "APPROVED"
-run_test "High-risk payment"       "<payment><amount>6000</amount></payment>" "REVIEW_REQUIRED"
-run_test "Exact threshold (5000)"  "<payment><amount>5000</amount></payment>" "APPROVED"
-run_test "Just over (5001)"        "<payment><amount>5001</amount></payment>" "REVIEW_REQUIRED"
-run_test "Missing amount tag"      "<payment><payer>test</payer></payment>"   "INVALID_REQUEST"
-
-echo ""
-echo "Results: $PASS passed, $FAIL failed"
-```
-
-### Local Build & Test
-
-```bash
-# Build fat JAR
-mvn clean package
-
-# Run locally (port 8080)
-java -jar target/payment-fraud-poc-1.0-SNAPSHOT.jar
-
-# Test locally
-curl -X POST \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>1000</amount></payment>" \
-  http://localhost:8080/api/payment
-```
-
----
-
-## 9. Audit & Observability
-
-### Correlation ID Tracing
-
-Every request is tagged with a `correlationId` that flows through all log lines:
-
-```
-2025-05-22 10:34:12 [Camel-Main] INFO  [txn-uuid-1234] com.bank.PaymentApp - amount=1000 status=APPROVED
-```
-
-Configured via:
-- `application.properties` — `camel.main.useMdcLogging=true` + `camel.main.mdcLoggingKeysPattern=correlationId`
-- `logback.xml` — log pattern includes `[%X{correlationId}]`
-
-### What is logged
-
-| Event | Log entry |
-|---|---|
-| Payment received | Transaction ID, payer, payee, amount, currency |
-| Validation result | PASS or FAIL with reason |
-| Fraud check dispatched | Correlation ID, target system |
-| Fraud decision received | APPROVED / REJECTED with matched rule |
-| Final response | Status, duration, correlation ID |
-
-### Google Cloud Logs Explorer
-
-1. Open **Google Cloud Console → Logs Explorer**
-2. Filter by service name: `payment-fraud-engine-final`
-3. Search by the `correlationId` value from the `x-cloud-trace-context` response header
-4. Follow the complete decision path from request receipt to fraud outcome
+| Java | 17 | Runtime |
+| Apache Camel | 4.8.3 | Integration framework + EIP patterns |
+| ActiveMQ | 6.1.3 embedded | JMS broker — no external server needed |
+| camel-netty-http | 4.8.3 | HTTP REST transport for PPS endpoints |
+| camel-jms | 4.8.3 | JMS messaging routes |
+| camel-jackson | 4.8.3 | JSON — PPS receives JSON, BS sends JSON |
+| camel-jaxb | 4.8.3 | XML — BS marshals to XML, FCS unmarshal |
+| SLF4J + Logback | 1.5.6 | Structured audit logging with MDC correlationId |
+| Maven Shade | 3.6.0 | Fat JAR packaging |
+| Docker | Latest | Containerisation |
 
 ---
 
@@ -585,382 +489,271 @@ Configured via:
 
 ### Prerequisites
 
-| Tool | Version |
-|---|---|
-| Java | 17 (Eclipse Temurin) |
-| Maven | 3.8+ |
-| Docker | 20+ (for containerised run) |
-
-### Build
-
 ```bash
-mvn clean package
+java -version    # Java 17+
+mvn -version     # Maven 3.8+
+curl --version   # For testing
 ```
 
-### Run Locally
+### Step 1 — Build
 
-```bash
-java -jar target/payment-fraud-poc-1.0-SNAPSHOT.jar
-# Service starts on http://0.0.0.0:8080/api/payment
-```
-
-### Docker
-
-```bash
-# Build image (multi-stage: compile then runtime)
-docker build -t payment-fraud-poc .
-
-# Run container
-docker run -p 8080:8080 payment-fraud-poc
-```
-
----
-
-## 11. Setup & Validation Steps
-
-Follow these steps in order to verify the service is fully working — locally and in production.
-
-### Step 1 — Verify Java & Maven are Installed
-
-**Check Java**
-```bash
-java -version
-```
-
-**Check Maven**
-```bash
-mvn -version
-```
-
-**Expected Output**
-- `openjdk version "17..."` or higher
-- `Apache Maven 3.8.x` or higher
-
-> ⚠️ If not installed: Install from [https://adoptium.net](https://adoptium.net) (Java 17) and [https://maven.apache.org](https://maven.apache.org)
-
----
-
-### Step 2 — Build the Project
-
-**Go to project root**
-```bash
-cd bank-payment-fraud-poc-main
-```
-
-**Clean build**
 ```bash
 mvn clean package -DskipTests
 ```
 
-**Confirm JAR exists**
-```bash
-ls -lh target/*.jar
-```
+✅ Expected: `[INFO] BUILD SUCCESS`
 
-**Expected Output**
-- `[INFO] BUILD SUCCESS`
-- `payment-fraud-poc-1.0-SNAPSHOT.jar` (~20MB fat JAR)
-
-> ⚠️ If BUILD FAILURE: check `pom.xml` dependencies and confirm internet access to Maven Central
-
----
-
-### Step 3 — Start the Service Locally
+### Step 2 — Start
 
 ```bash
 java -jar target/payment-fraud-poc-1.0-SNAPSHOT.jar
 ```
 
-**Expected Output**
-- `Started Apache Camel`
-- `Route: netty-http://0.0.0.0:8080/api/payment`
-- No port conflict errors
+✅ Expected startup:
+```
+Bank Payment Fraud Detection PoC — Starting
+Solution 2 (REST sync): POST http://localhost:8080/api/v1/payments
+Solution 1 (JMS async): POST http://localhost:8080/api/v1/payments/secure
+```
 
-> ⚠️ If port 8080 is busy: `lsof -ti:8080 | xargs kill` then retry
-
----
-
-### Step 4 — Validate: Approved Payment (amount ≤ 5000)
+### Step 3 — Docker
 
 ```bash
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>1000</amount></payment>"
+docker build -t bank-fraud-poc:latest .
+docker run -d -p 8080:8080 --name bank-fraud-poc bank-fraud-poc:latest
+docker logs -f bank-fraud-poc
 ```
-
-**Expected:** `<response><status>APPROVED</status></response>`
-
-> ⚠️ If INVALID_REQUEST: the route is not reading the body — check stream caching config in `PaymentApp.java`
 
 ---
 
-### Step 5 — Validate: Review Required (amount > 5000)
+## 11. Validate Each Requirement
+
+### REQ-1: Valid payment — APPROVED (Solution 2 REST)
 
 ```bash
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>6000</amount></payment>"
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":      "550e8400-e29b-41d4-a716-446655440001",
+    "payerName":          "John Smith",
+    "payerBank":          "Bank of America",
+    "payerCountryCode":   "GBR",
+    "payerAccount":       "123456789",
+    "payeeName":          "Jane Doe",
+    "payeeBank":          "BNP Paribas",
+    "payeeCountryCode":   "DEU",
+    "payeeAccount":       "987654321",
+    "paymentInstruction": "Salary",
+    "executionDate":      "2025-05-22",
+    "amount":             "1500.00",
+    "currency":           "EUR",
+    "creationTimestamp":  "2025-05-22T09:00:00Z"
+  }'
 ```
 
-**Expected:** `<response><status>REVIEW_REQUIRED</status></response>`
-
-> ⚠️ If APPROVED: threshold logic is broken — check the `> 5000` condition in `PaymentApp.java`
+✅ HTTP 200:
+```json
+{"transactionId":"550e8400...","status":"APPROVED","message":"Nothing found, all okay","reason":""}
+```
 
 ---
 
-### Step 6 — Validate: Invalid Payload (no amount tag)
+### REQ-2: Blocked payer name — REJECTED
 
 ```bash
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><payer>John</payer></payment>"
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"550e8400-e29b-41d4-a716-446655440002",
+    "payerName":"Mark Imaginary","payerBank":"Bank of America",
+    "payerCountryCode":"GBR","payerAccount":"111",
+    "payeeName":"Jane Doe","payeeBank":"BNP Paribas",
+    "payeeCountryCode":"DEU","payeeAccount":"222",
+    "executionDate":"2025-05-22","amount":"500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
-**Expected:** `<response><status>INVALID_REQUEST</status></response>`
-
-> ⚠️ If APPROVED: the `contains()` check is not running — check your `if`-block in `PaymentApp.java`
+✅ HTTP 403:
+```json
+{"transactionId":"...","status":"REJECTED","message":"Suspicious payment","reason":"payer name blocked"}
+```
 
 ---
 
-### Step 7 — Validate: HTTP Status Code is Always 200
+### REQ-3: Blocked country (IRN) — REJECTED
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}" -X POST \
-  http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>1000</amount></payment>"
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"550e8400-e29b-41d4-a716-446655440003",
+    "payerName":"John Smith","payerBank":"Barclays",
+    "payerCountryCode":"IRN","payerAccount":"333",
+    "payeeName":"Jane Doe","payeeBank":"BNP",
+    "payeeCountryCode":"DEU","payeeAccount":"444",
+    "executionDate":"2025-05-22","amount":"500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
-**Expected:** `200`
-
-> ⚠️ If 500: unhandled exception in route — check console logs for stack trace
+✅ HTTP 403 — `"reason":"payer country restricted"`
 
 ---
 
-### Step 8 — Validate: Audit Log Prints to Console
+### REQ-4: Blocked bank — REJECTED
 
 ```bash
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -H "X-Correlation-ID: test-audit-001" \
-  -d "<payment><amount>1000</amount></payment>"
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"550e8400-e29b-41d4-a716-446655440004",
+    "payerName":"John Smith","payerBank":"Bank of Kunlun",
+    "payerCountryCode":"GBR","payerAccount":"555",
+    "payeeName":"Jane Doe","payeeBank":"BNP",
+    "payeeCountryCode":"DEU","payeeAccount":"666",
+    "executionDate":"2025-05-22","amount":"500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
-In the terminal running the JAR, you should see:
-```
-2025-MM-DD HH:MM:SS [Camel...] INFO [] com.bank.PaymentApp - ...
-DEBUG_ACTUAL_BODY: <payment><amount>1000</amount></payment>
-```
-
-> ⚠️ If no log output: check `logback.xml` is in `src/main/resources` and is included in the JAR
+✅ HTTP 403 — `"reason":"payer bank blocked"`
 
 ---
 
-### Step 9 — Run All Validation Tests in One Script
+### REQ-5: Blocked payment instruction — REJECTED
 
 ```bash
-cat > validate.sh << 'EOF'
-#!/bin/bash
-URL="http://localhost:8080/api/payment"
-PASS=0; FAIL=0
-check() {
-  RES=$(curl -s -X POST "$URL" \
-    -H "Content-Type: application/xml" -d "$2")
-  if echo "$RES" | grep -q "$3"; then
-    echo "PASS: $1"
-    ((PASS++))
-  else
-    echo "FAIL: $1 — got: $RES"
-    ((FAIL++))
-  fi
-}
-check "Approved 1000"       "<payment><amount>1000</amount></payment>"  "APPROVED"
-check "Review 6000"         "<payment><amount>6000</amount></payment>"  "REVIEW_REQUIRED"
-check "Threshold 5000"      "<payment><amount>5000</amount></payment>"  "APPROVED"
-check "Over threshold 5001" "<payment><amount>5001</amount></payment>"  "REVIEW_REQUIRED"
-check "No amount tag"       "<payment><payer>test</payer></payment>"    "INVALID_REQUEST"
-check "Non-numeric"         "<payment><amount>abc</amount></payment>"   "ERROR_PARSING"
-echo "---"
-echo "Result: $PASS passed, $FAIL failed"
-EOF
-chmod +x validate.sh && ./validate.sh
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"550e8400-e29b-41d4-a716-446655440005",
+    "payerName":"John Smith","payerBank":"Bank of America",
+    "payerCountryCode":"GBR","payerAccount":"777",
+    "payeeName":"Jane Doe","payeeBank":"BNP",
+    "payeeCountryCode":"DEU","payeeAccount":"888",
+    "paymentInstruction":"Artillery Procurement",
+    "executionDate":"2025-05-22","amount":"500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
-**Expected Output**
-```
-PASS: Approved 1000
-PASS: Review 6000
-PASS: Threshold 5000
-PASS: Over threshold 5001
-PASS: No amount tag
-PASS: Non-numeric
----
-Result: 6 passed, 0 failed
-```
-
-> ⚠️ Any FAIL line shows what the service returned — compare to expected and fix the route logic
+✅ HTTP 403 — `"reason":"payment instruction blocked"`
 
 ---
 
-### Step 10 — Validate: Docker Build & Run
+### REQ-6: Invalid UUID — 400
 
 ```bash
-# Build image
-docker build -t payment-fraud-poc .
-
-# Run container
-docker run -p 8080:8080 payment-fraud-poc
-
-# Test from another terminal
-curl -s -X POST http://localhost:8080/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>1000</amount></payment>"
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"NOT-A-UUID",
+    "payerName":"John Smith","payerBank":"Bank of America",
+    "payerCountryCode":"GBR","payerAccount":"123",
+    "payeeName":"Jane Doe","payeeBank":"BNP","payeeCountryCode":"DEU","payeeAccount":"456",
+    "executionDate":"2025-05-22","amount":"500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
-**Expected Output**
-- `Successfully built`
-- `Started Apache Camel` (in container logs)
-- `<response><status>APPROVED</status></response>`
-
-> ⚠️ If build fails: check Dockerfile uses `maven:3.8` stage then `eclipse-temurin:17-jre`. If port conflict: use `-p 8081:8080`
+✅ HTTP 400 — `"reason":"transactionId must be UUID format"`
 
 ---
 
-### Step 11 — Validate: Cloud Run Live Endpoint
+### REQ-7: Invalid ISO country code — 400
 
 ```bash
-# Approved test
-curl -s -X POST \
-  https://payment-fraud-engine-final-o3o5ycvrka-ey.a.run.app/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>1000</amount></payment>"
-
-# Review required test
-curl -s -X POST \
-  https://payment-fraud-engine-final-o3o5ycvrka-ey.a.run.app/api/payment \
-  -H "Content-Type: application/xml" \
-  -d "<payment><amount>6000</amount></payment>"
-
-# Check Cloud Logs
-gcloud logging read 'resource.type=cloud_run_revision' --limit=20 --format=json
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"550e8400-e29b-41d4-a716-446655440006",
+    "payerName":"John Smith","payerBank":"Bank of America",
+    "payerCountryCode":"XX","payerAccount":"123",
+    "payeeName":"Jane Doe","payeeBank":"BNP","payeeCountryCode":"DEU","payeeAccount":"456",
+    "executionDate":"2025-05-22","amount":"500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
-**Expected Output**
-- `APPROVED`
-- `REVIEW_REQUIRED`
-- Log entries with `correlationId` visible in Cloud Console
-
-> ⚠️ If 403 on GET: correct — only POST is allowed. If 503: service is cold-starting, retry in ~30s
+✅ HTTP 400 — `"reason":"payerCountryCode 'XX' is not a valid ISO 3166-1 alpha-3"`
 
 ---
 
-## 12. Deployment
-
-Deployed to **Google Cloud Run** (Knative) in `europe-west3`.
-
-| Parameter | Value |
-|---|---|
-| Region | `europe-west3` (Frankfurt) |
-| Max replicas | 3 |
-| CPU limit | 1000m (1 vCPU) |
-| Memory limit | 1 Gi |
-| Request timeout | 300 seconds |
-| Concurrency | 80 requests / container |
-| Startup probe | TCP :8080, 30s delay, 24 retries |
-
-### Live Endpoint
-
-```
-https://payment-fraud-engine-final-o3o5ycvrka-ey.a.run.app/api/payment
-```
-
-### Deploy via gcloud
+### REQ-8: Solution 1 async JMS — 202 + status poll
 
 ```bash
-# Build and push image
-docker build -t europe-west3-docker.pkg.dev/<PROJECT>/cloud-run-source-deploy/payment-fraud-engine:final .
-docker push europe-west3-docker.pkg.dev/<PROJECT>/cloud-run-source-deploy/payment-fraud-engine:final
-
-# Apply service spec
-gcloud run services replace service.yaml --region=europe-west3
+# Submit async payment
+curl -i -X POST http://localhost:8080/api/v1/payments/secure \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId":"660e8400-e29b-41d4-a716-446655440010",
+    "payerName":"John Smith","payerBank":"Bank of America",
+    "payerCountryCode":"GBR","payerAccount":"123456789",
+    "payeeName":"Jane Doe","payeeBank":"BNP Paribas",
+    "payeeCountryCode":"DEU","payeeAccount":"987654321",
+    "executionDate":"2025-05-22","amount":"1500.00",
+    "currency":"EUR","creationTimestamp":"2025-05-22T09:00:00Z"
+  }'
 ```
 
----
+✅ HTTP 202 (immediate):
+```json
+{"transactionId":"660e8400...","status":"ACCEPTED_FOR_PROCESSING","message":"Payment submitted for fraud screening via JMS"}
+```
 
-## 13. Tech Stack
+```bash
+# Poll for result
+sleep 3 && curl -i http://localhost:8080/api/v1/payments/660e8400-e29b-41d4-a716-446655440010/status
+```
 
-| Layer | Technology |
-|---|---|
-| Language | Java 17 |
-| Integration framework | Apache Camel 4.8.3 |
-| HTTP transport | camel-netty-http (Netty 4) |
-| Messaging (planned) | Apache ActiveMQ (JMS) |
-| Serialisation | XML (payments & BS↔FCS) · JSON (broker API & REST) |
-| Logging | SLF4J + Logback + MDC `correlationId` |
-| Build | Maven 3.8 + maven-shade-plugin (fat JAR) |
-| Containerisation | Docker multi-stage (eclipse-temurin:17-jre) |
-| Deployment | Google Cloud Run (Knative) — europe-west3 |
-| Observability | Google Cloud Logs Explorer |
+✅ HTTP 200: `{"transactionId":"660e8400...","status":"APPROVED"}`
 
 ---
 
-## 14. Demo Expectations
+## 12. Camel EIP Patterns Used
 
-The live demo must run both solutions end-to-end. No PowerPoint-only presentation.
-
-### Mandatory Demo Scenarios
-
-| # | Scenario | What to show |
+| Pattern | Code | Purpose |
 |---|---|---|
-| 1 | Solution 1 — JMS messaging | PPS → BS → FCS → BS → PPS via ActiveMQ queues |
-| 2 | Solution 2 — REST API | PPS → BS → FCS → BS → PPS via REST endpoints |
-| 3 | Approved payment | Clean payment, no blacklist matches → `APPROVED` |
-| 4 | Rejected payment | Blacklisted name / country / bank / instruction → `REJECTED` |
-| 5 | Audit log demonstration | Show correlationId trace across all three systems |
-| 6 | Source code walkthrough | Explain Camel routes, JSON↔XML transformation, blacklist logic |
-| 7 | UML architecture explanation | Walk through component diagram and sequence flows |
-| 8 | Correlation traceability | Follow a single transaction ID end-to-end in logs |
-
-### Time Limit
-
-**Maximum 90 minutes**
-
-### Optional Enhancements (if time allows)
-
-- Docker / OpenShift deployment demo
-- Monitoring dashboard
-- Persistent audit storage
-- Metrics collection
+| **Wire Tap** | `.wireTap("jms:queue:auditQueue")` | Async audit on every request — both solutions, every stage |
+| **Content-Based Router** | `.choice().when(header("Content-Type").contains("xml"))` | Route JSON or XML input in PPS unmarshal step |
+| **Message Translator** | JAXB `marshal(jaxb)` / `unmarshal(jaxb)` in BS | JSON↔XML — BS converts between PPS (JSON) and FCS (XML) |
+| **Fire-and-Forget** | `?exchangePattern=InOnly` | Solution 1: async JMS dispatch from PPS — immediate 202 |
+| **Correlation ID** | `setHeader("correlationId", txId)` | transactionId propagated via MDC through all systems |
+| **Request-Reply** | `?exchangePattern=InOut` | Solution 2: synchronous BS→FCS via JMS bsToFCS queue |
 
 ---
 
-## 15. Roadmap / Remaining Tasks
+## 13. Final Status Report
 
-### Core — required for full PoC
+### Exercise Spec Compliance
 
-- [ ] **PPS** — Full JSON payment validation (UUID, ISO country/currency, date, timestamp)
-- [ ] **BS** — JSON → XML converter (payment request)
-- [ ] **BS** — XML → JSON converter (fraud response)
-- [ ] **BS** — ActiveMQ JMS producer and consumer routes
-- [ ] **FCS** — Name blacklist check (payer + payee)
-- [ ] **FCS** — Country blacklist check (ISO alpha-3)
-- [ ] **FCS** — Bank blacklist check
-- [ ] **FCS** — Payment instruction blacklist check
-- [ ] **FCS** — Approve / reject decision with structured JSON response
-- [ ] **Solution 1** — End-to-end JMS messaging flow (PPS ↔ BS ↔ FCS)
-- [ ] **Solution 2** — End-to-end REST flow (PPS ↔ BS ↔ FCS)
-- [ ] **Shared** — BS ↔ FCS XML-over-JMS integration (both solutions)
+| Requirement | Spec | Implementation | Status |
+|---|---|---|---|
+| PPS receives payment in JSON | JSON only | `application/json` Content-Type, Jackson unmarshal | ✅ |
+| PPS validates ISO country code | ISO alpha-3 | `Locale.getISOCountries()` set validated | ✅ |
+| PPS validates ISO currency code | ISO 4217 | `Currency.getInstance()` validated | ✅ |
+| PPS invokes BS for fraud check | Invoke BS | `direct:bs-sync` (Sol2) or `jms:ppsToBS` (Sol1) | ✅ |
+| PPS processes result from BS | APPROVED/REJECTED | Sync: HTTP response. Async: StatusStore | ✅ |
+| BS receives JSON from PPS | JSON in | `unmarshal().json(JsonLibrary.Jackson, PaymentDTO.class)` | ✅ |
+| BS converts JSON to XML | JAXB | `marshal(jaxb)` — PaymentDTO → XML | ✅ |
+| BS sends XML to FCS | XML/JMS | `jms:queue:bsToFCS` | ✅ |
+| BS receives XML from FCS | XML/JMS | `jms:queue:fcsToBS` consumer | ✅ |
+| BS converts XML to JSON | XML parse + JSON string | `extractTag()` + JSON response string | ✅ |
+| BS sends JSON to PPS | JSON out | `jms:queue:bsToPPS` or direct response | ✅ |
+| FCS receives XML from BS | XML/JMS | `jms:queue:bsToFCS` consumer + `unmarshal(jaxb)` | ✅ |
+| FCS checks name (payer + payee) | Blacklist | 4 names — case-insensitive exact match | ✅ |
+| FCS checks country (payer + payee) | Blacklist | 6 countries: CUB IRQ IRN PRK SDN SYR | ✅ |
+| FCS checks bank (payer + payee) | Blacklist | 2 banks — case-insensitive match | ✅ |
+| FCS checks payment instruction | Blacklist | 2 instructions — case-insensitive match | ✅ |
+| FCS sends XML result to BS | XML/JMS | `jms:queue:fcsToBS` | ✅ |
+| Solution 1: PPS↔BS via JMS + JSON | JMS + JSON | `jms:ppsToBS` and `jms:bsToPPS` | ✅ |
+| Solution 2: PPS↔BS via REST + JSON | REST + JSON | `seda:pps-sync` → `direct:bs-sync` | ✅ |
+| Both solutions: BS↔FCS via JMS + XML | JMS + XML | `jms:bsToFCS` and `jms:fcsToBS` | ✅ |
+| Audit logging — all components | Wire Tap | `jms:auditQueue` + MDC correlationId | ✅ |
 
-### Quality & Operations
-
-- [ ] Unit tests — validation logic and fraud decision rules
-- [ ] Integration tests — full PPS ↔ BS ↔ FCS flows
-- [ ] Fraud scenario tests — all four blacklist categories
-- [ ] `correlationId` propagated through all three systems end-to-end
-- [ ] Structured audit log entry for every fraud decision
-- [ ] UML component diagram (for demo)
-- [ ] OpenShift / Kubernetes deployment manifests (optional)
+**✅ PROJECT COMPLETE — DEMO READY**
 
 ---
 
-*PoC: Bank Payment Fraud Detection · Java 17 · Apache Camel 4.8.3 · Apache ActiveMQ · Google Cloud Run*
+*Bank Payment Fraud Detection PoC · Java 17 · Apache Camel 4.8 · ActiveMQ 6 · REST + JMS*
