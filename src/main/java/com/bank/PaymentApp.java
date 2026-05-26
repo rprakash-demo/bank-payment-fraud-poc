@@ -169,13 +169,19 @@ public class PaymentApp extends RouteBuilder {
                 .process(exchange -> {
                     PaymentDTO payment = exchange.getIn().getBody(PaymentDTO.class);
                     STATUS_STORE.put(payment.getTransactionId(), "PROCESSING"); // Mark as queued
+                    
+                    // Keep a copy of the ID inside Camel Exchange properties before marshaling
+                    exchange.setProperty("currentTransactionId", payment.getTransactionId());
                 })
                 .marshal().json(JsonLibrary.Jackson)
                 .to("jms:queue:ppsToBS") // Send to background queue
                 .process(exchange -> {
+                    // Extract the saved ID to display in the final response
+                    String txId = exchange.getProperty("currentTransactionId", String.class);
+                    
                     // Instantly return 202 Accepted to the caller
                     exchange.getMessage().getHeaders().clear();
-                    exchange.getMessage().setBody("{\"status\":\"ACCEPTED_FOR_PROCESSING\",\"message\":\"Queued\"}");
+                    exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"ACCEPTED_FOR_PROCESSING\",\"message\":\"Queued\"}");
                     exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
                     exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 202);
                     exchange.getMessage().setHeader("Connection", "close");
@@ -203,13 +209,17 @@ public class PaymentApp extends RouteBuilder {
                 .convertBodyTo(String.class)
                 .process(exchange -> {
                     String body = exchange.getIn().getBody(String.class);
+                    
+                    // Extract transactionId from the incoming XML body using our helper method
+                    String txId = extractTag(body, "transactionId");
+                    
                     exchange.getMessage().getHeaders().clear();
 
                     if (body.contains("<status>REJECTED</status>")) {
-                        exchange.getMessage().setBody("{\"status\":\"REJECTED\",\"message\":\"Fraud Policy Violation\"}");
+                        exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"REJECTED\",\"message\":\"Fraud Policy Violation\"}");
                         exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 403);
                     } else {
-                        exchange.getMessage().setBody("{\"status\":\"APPROVED\",\"message\":\"Nothing found, all okay\"}");
+                        exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"APPROVED\",\"message\":\"Nothing found, all okay\"}");
                         exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 200);
                     }
 
