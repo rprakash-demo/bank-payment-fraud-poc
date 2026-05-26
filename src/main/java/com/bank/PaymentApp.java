@@ -8,89 +8,50 @@ import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.converter.jaxb.JaxbDataFormat;
 import org.apache.camel.model.dataformat.JsonLibrary;
 
-import java.util.concurrent.ConcurrentHashMap;
-
 /**
- * ==============================================================================
- * Bank Payment Fraud Detection PoC
- * ==============================================================================
+ * Bank Payment Fraud Detection PoC — Apache Camel Route Definitions
  *
- * BUSINESS WORKFLOW (DATA PIPELINE):
+ * Solution 1: POST /api/v1/payments/secure  — Async JMS  (PPS ↔ BS via JSON/JMS)
+ * Solution 2: POST /api/v1/payments             — Sync REST  (PPS ↔ BS via JSON/REST)
  *
- * [Client]
- * │
- * ├── (JSON Request) ──> [PPS API Gateway]
- * │
- * ├── Enforces JSON-only & UUID Validation
- * │
- * └──> [Broker System]
- * │
- * ├── Translates JSON to Legacy XML
- * │
- * └── (ActiveMQ) ──> [Fraud Check System]
- * │
- * ├── Evaluates AML Rules
- * ├── Checks Blacklists
- * │
- * <── (JSON Response) <── (Converts Result to JSON) <── (ActiveMQ) <──
+ * Both solutions: BS ↔ FCS via XML/JMS
  *
- *
- * API ENDPOINTS (SOLUTIONS):
- * Solution 1: POST /api/v1/payments/secure      — async JMS (Returns 202 Accepted)
- * Solution 2: POST /api/v1/payments             — sync REST (Returns 200 OK / 400 / 403)
- * Status Chk: GET  /api/v1/payments/{id}/status — async status polling
- * ==============================================================================
+ * Flow:
+ * Client → PPS (validate) → BS (JSON→XML) → FCS (blacklist check)
+ * → BS (XML→JSON)  → PPS (process result) → Client
  */
 public class PaymentApp extends RouteBuilder {
 
-    /*
-     * ARCHITECTURE NOTE: We use a ConcurrentHashMap to simulate a high-speed,
-     * thread-safe database for checking asynchronous payment statuses.
-     */
-    private static final ConcurrentHashMap<String, String> STATUS_STORE = new ConcurrentHashMap<>();
+    private final PaymentValidator validator = new PaymentValidator();
+    private JaxbDataFormat jaxbFormat;
 
     @Override
     public void configure() throws Exception {
 
-        // Set up XML parsing (JAXB) for the internal Broker/Fraud systems
+        // Shared JAXB context for BS: JSON→XML (request) and XML→JSON (response)
         JAXBContext context = JAXBContext.newInstance(PaymentDTO.class);
-        JaxbDataFormat jaxb = new JaxbDataFormat(context);
+        this.jaxbFormat = new JaxbDataFormat(context);
 
-        // Instantiate our custom validation logic (UUIDs, ISO codes, etc.)
-        PaymentValidator validator = new PaymentValidator();
-
-        /* ==============================================================================
-         * 1. GLOBAL ERROR HANDLER
-         * DEFENSE EXPLANATION: We intercept all exceptions here. Even if a user sends
-         * XML to a JSON endpoint, or fails a UUID check, we catch it and force a strict
-         * JSON error response to ensure API contract compliance.
-         * ============================================================================== */
+        // ── Global Exception Handler ───────────────────────────────────────────
+        // Catches validation and runtime errors — returns standard JSON error body
         onException(Exception.class)
                 .handled(true)
                 .process(exchange -> {
-                    exchange.getMessage().getHeaders().clear();
-
-                    String errorMessage = "Invalid Request";
                     Exception cause = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
-                    if (cause != null && cause.getMessage() != null) {
-                        errorMessage = cause.getMessage();
-                    }
-
-                    // Force response to be JSON format
+                    String txId = exchange.getProperty("txId", String.class);
+                    String msg = (cause != null && cause.getMessage() != null)
+                            ? cause.getMessage() : "Invalid request";
                     exchange.getMessage().setBody(
-                            "{\"status\":\"REJECTED\",\"message\":\"" + errorMessage + "\"}"
+                            "{\"transactionId\":\"" + (txId != null ? txId : "UNKNOWN") + "\"," +
+                            "\"status\":\"REJECTED\"," +
+                            "\"message\":\"" + msg + "\"}"
                     );
-
                     exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
                     exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 400);
                     exchange.getMessage().setHeader("Connection", "close");
                 });
 
-        /* ==============================================================================
-         * 2. REST API CONFIGURATION
-         * DEFENSE EXPLANATION: We expose port 8080. We explicitly set the routes to
-         * consume and produce only application/json, acting as our first line of defense.
-         * ============================================================================== */
+        // ── REST Configuration ─────────────────────────────────────────────────
         restConfiguration()
                 .component("netty-http")
                 .host("0.0.0.0")
@@ -99,227 +60,179 @@ public class PaymentApp extends RouteBuilder {
         rest("/api/v1/payments")
                 .consumes("application/json")
                 .produces("application/json")
-                .post()                 // Synchronous processing
-                .to("seda:pps-sync")
-                .post("/secure")        // Asynchronous processing
-                .to("seda:pps-async")
-                .get("/{transactionId}/status") // Status polling
-                .to("direct:get-status");
+                .post()
+                    .to("direct:pps-sync")      // Solution 2 — Sync REST
+                .post("/secure")
+                    .to("direct:pps-async");    // Solution 1 — Async JMS
 
-        /* ==============================================================================
-         * 3. ASYNC STATUS LOOKUP (GET ROUTE)
-         * DEFENSE EXPLANATION: A lightweight route that allows clients to poll for the
-         * status of queued payments without blocking backend resources.
-         * ============================================================================== */
-        from("direct:get-status")
-                .routeId("status-check")
-                .process(exchange -> {
-                    String txId = exchange.getIn().getHeader("transactionId", String.class);
-                    String status = STATUS_STORE.getOrDefault(txId, "NOT_FOUND");
+        // ══════════════════════════════════════════════════════════════════════
+        // PPS — PAYMENT PROCESSING SYSTEM
+        // ══════════════════════════════════════════════════════════════════════
 
-                    exchange.getMessage().getHeaders().clear();
-
-                    if ("NOT_FOUND".equals(status)) {
-                        exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"NOT_FOUND\"}");
-                        exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 404);
-                    } else {
-                        exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"" + status + "\"}");
-                        exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 200);
-                    }
-
-                    exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
-                    exchange.getMessage().setHeader("Connection", "close");
-                });
-
-        /* ==============================================================================
-         * 4. PPS COMPONENT: SYNCHRONOUS ROUTE
-         * DEFENSE EXPLANATION: Blocks invalid Content-Types, unmarshals JSON, runs business
-         * logic validation, and passes it to the Broker System.
-         * ============================================================================== */
-        from("seda:pps-sync")
+        // ── PPS: Solution 2 — Synchronous REST ────────────────────────────────
+        // Receives JSON → validates → sends to BS → returns fraud result to client
+        from("direct:pps-sync")
                 .routeId("pps-sync")
-                .wireTap("jms:queue:auditQueue") // Send copy to audit log silently
-                .process(exchange -> {
-                    String contentType = exchange.getIn().getHeader(Exchange.CONTENT_TYPE, String.class);
-                    if (contentType != null && !contentType.contains("json")) {
-                        throw new IllegalArgumentException("Unsupported Media Type. PPS only accepts application/json");
-                    }
-                })
+                .wireTap("jms:queue:auditQueue")                            // Audit: payment received
                 .unmarshal().json(JsonLibrary.Jackson, PaymentDTO.class)
-                .bean(validator, "validate")
+                .process(exchange -> {
+                    PaymentDTO dto = exchange.getIn().getBody(PaymentDTO.class);
+                    if (dto != null) exchange.setProperty("txId", dto.getTransactionId());
+                })
+                .bean(validator, "validate")                                // Validate 13 mandatory fields
                 .marshal().json(JsonLibrary.Jackson)
-                .to("direct:bs-sync");
+                .to("direct:bs-sync");                                      // Hand off to BS
 
-        /* ==============================================================================
-         * 5. PPS COMPONENT: ASYNCHRONOUS ROUTE (CORE REQUIREMENT)
-         * DEFENSE EXPLANATION: Drops the validated message into an ActiveMQ queue for
-         * background processing, and immediately returns a 202 Accepted to free up the client.
-         * ============================================================================== */
-        from("seda:pps-async")
+        // ── PPS: Solution 1 — Asynchronous JMS ────────────────────────────────
+        // Receives JSON → validates → publishes to JMS queue → returns 202 immediately
+        from("direct:pps-async")
                 .routeId("pps-async")
-                .wireTap("jms:queue:auditQueue")
-                .process(exchange -> {
-                    String contentType = exchange.getIn().getHeader(Exchange.CONTENT_TYPE, String.class);
-                    if (contentType != null && !contentType.contains("json")) {
-                        throw new IllegalArgumentException("Unsupported Media Type. PPS only accepts application/json");
-                    }
-                })
+                .wireTap("jms:queue:auditQueue")                            // Audit: payment received
                 .unmarshal().json(JsonLibrary.Jackson, PaymentDTO.class)
-                .bean(validator, "validate")
                 .process(exchange -> {
-                    PaymentDTO payment = exchange.getIn().getBody(PaymentDTO.class);
-                    STATUS_STORE.put(payment.getTransactionId(), "PROCESSING"); // Mark as queued
-                    
-                    // Keep a copy of the ID inside Camel Exchange properties before marshaling
-                    exchange.setProperty("currentTransactionId", payment.getTransactionId());
+                    PaymentDTO dto = exchange.getIn().getBody(PaymentDTO.class);
+                    if (dto != null) exchange.setProperty("txId", dto.getTransactionId());
                 })
+                .bean(validator, "validate")                                // Validate 13 mandatory fields
                 .marshal().json(JsonLibrary.Jackson)
-                .to("jms:queue:ppsToBS") // Send to background queue
+                .to("jms:queue:ppsToBS")                                    // Publish JSON to BS via JMS
                 .process(exchange -> {
-                    // Extract the saved ID to display in the final response
-                    String txId = exchange.getProperty("currentTransactionId", String.class);
-                    
-                    // Instantly return 202 Accepted to the caller
+                    String txId = exchange.getProperty("txId", String.class);
                     exchange.getMessage().getHeaders().clear();
-                    exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"ACCEPTED_FOR_PROCESSING\",\"message\":\"Queued\"}");
+                    exchange.getMessage().setBody(
+                            "{\"transactionId\":\"" + txId + "\"," +
+                            "\"status\":\"ACCEPTED_FOR_PROCESSING\"," +
+                            "\"message\":\"Payment submitted for fraud screening via JMS\"}"
+                    );
                     exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
                     exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 202);
                     exchange.getMessage().setHeader("Connection", "close");
                 });
 
-        /* ==============================================================================
-         * 6. BROKER SYSTEM (BS): SYNCHRONOUS
-         * DEFENSE EXPLANATION: Acts as a middleware translator. Receives JSON from PPS,
-         * converts it to XML required by the Fraud System, and triggers InOut pattern.
-         * ============================================================================== */
+        // ── PPS: Async Result Consumer ─────────────────────────────────────────
+        // Receives final processing results from BS via JSON/JMS
+        from("jms:queue:bsToPPS")
+                .routeId("pps-result")
+                .wireTap("jms:queue:auditQueue")                            // Audit: final result received
+                .choice()
+                    .when().jsonpath("$.status == 'APPROVED'")
+                        .log("[${jsonpath($.transactionId)}] APPROVED — processing payment downstream")
+                    .otherwise()
+                        .log("[${jsonpath($.transactionId)}] REJECTED — halting payment processing")
+                .end();
+
+        // ══════════════════════════════════════════════════════════════════════
+        // BS — BROKER SYSTEM
+        // ══════════════════════════════════════════════════════════════════════
+
+        // ── BS: Solution 2 — Sync JSON→XML → FCS → XML→JSON ───────────────────
+        // Translates JSON to XML, sends to FCS via JMS (InOut), converts result back to JSON
         from("direct:bs-sync")
                 .routeId("bs-sync")
                 .unmarshal().json(JsonLibrary.Jackson, PaymentDTO.class)
-                .marshal(jaxb) // Data Transformation: JSON -> XML
-                .to("jms:queue:bsToFCS?exchangePattern=InOut") // Wait for Fraud response
-                .to("direct:sync-response");
-
-        /* ==============================================================================
-         * 7. BROKER SYSTEM (BS): SYNCHRONOUS RESPONSE HANDLER
-         * DEFENSE EXPLANATION: Translates the Fraud System's XML response back into
-         * standard JSON for the API client to consume.
-         * ============================================================================== */
-        from("direct:sync-response")
-                .routeId("sync-response")
+                .marshal(jaxbFormat)                                        // JSON → XML
+                .setHeader("CorrelationTxId", exchangeProperty("txId"))
+                .to("jms:queue:bsToFCS?exchangePattern=InOut&requestTimeout=10000") 
                 .convertBodyTo(String.class)
-                .process(exchange -> {
-                    String body = exchange.getIn().getBody(String.class);
-                    
-                    // Extract transactionId from the incoming XML body using our helper method
-                    String txId = extractTag(body, "transactionId");
-                    
-                    exchange.getMessage().getHeaders().clear();
+                .choice()
+                    // Fixed: Replaced raw string inspection with a highly reliable standard XPath block
+                    .when().xpath("/payment/status/text() = 'APPROVED'")
+                        .process(exchange -> {
+                            String txId = exchange.getIn().getHeader("CorrelationTxId", String.class);
+                            exchange.getMessage().getHeaders().clear();
+                            exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"APPROVED\",\"message\":\"Nothing found, all okay\"}");
+                            exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 200);
+                            exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
+                            exchange.getMessage().setHeader("Connection", "close");
+                        })
+                    .otherwise()
+                        .process(exchange -> {
+                            String txId = exchange.getIn().getHeader("CorrelationTxId", String.class);
+                            exchange.getMessage().getHeaders().clear();
+                            exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"REJECTED\",\"message\":\"Suspicious payment\"}");
+                            exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 403);
+                            exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
+                            exchange.getMessage().setHeader("Connection", "close");
+                        })
+                .end();
 
-                    if (body.contains("<status>REJECTED</status>")) {
-                        exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"REJECTED\",\"message\":\"Fraud Policy Violation\"}");
-                        exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 403);
-                    } else {
-                        exchange.getMessage().setBody("{\"transactionId\":\"" + txId + "\",\"status\":\"APPROVED\",\"message\":\"Nothing found, all okay\"}");
-                        exchange.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 200);
-                    }
-
-                    exchange.getMessage().setHeader(Exchange.CONTENT_TYPE, "application/json");
-                    exchange.getMessage().setHeader("Connection", "close");
-                });
-
-        /* ==============================================================================
-         * 8. BROKER SYSTEM (BS): ASYNCHRONOUS WORKER
-         * DEFENSE EXPLANATION: Listens to the ActiveMQ queue, converts queued JSON
-         * payloads to XML, and passes them to the Fraud engine.
-         * ============================================================================== */
+        // ── BS: Solution 1 — Async JSON→XML → FCS ─────────────────────────────
+        // Consumes JSON from ppsToBS queue → translates to XML → forwards to FCS via InOnly JMS
         from("jms:queue:ppsToBS")
                 .routeId("bs-async")
                 .unmarshal().json(JsonLibrary.Jackson, PaymentDTO.class)
-                .marshal(jaxb)
-                .to("jms:queue:bsToFCS");
+                .marshal(jaxbFormat)                                        // JSON → XML
+                .to("jms:queue:bsToFCS?exchangePattern=InOnly");
 
-        /* ==============================================================================
-         * 9. FRAUD CHECK SYSTEM (FCS)
-         * DEFENSE EXPLANATION: A completely isolated component that strictly evaluates XML.
-         * We use Camel Choice and Simple languages to apply regex against blacklisted entities.
-         * ============================================================================== */
-        from("jms:queue:bsToFCS")
-                .routeId("fraud-engine")
-                .unmarshal(jaxb) // Parse the XML
+        // ── BS: Solution 1 — Async XML→JSON Result Transformer ──────────────────
+        // Intercepts async XML response from FCS, marshals to JSON using clean declarative expressions
+        from("jms:queue:fcsToBS")
+                .routeId("bs-async-result")
+                .wireTap("jms:queue:auditQueue")
                 .choice()
-                .when(simple(
+                    // Fixed: Swapped literal math style validation for robust text node extraction checking
+                    .when().xpath("/payment/status/text() = 'APPROVED'")
+                        .setBody(simple("{\"transactionId\":\"${xpath(/payment/transactionId/text())}\",\"status\":\"APPROVED\",\"message\":\"Nothing found, all okay\"}"))
+                    .otherwise()
+                        .setBody(simple("{\"transactionId\":\"${xpath(/payment/transactionId/text())}\",\"status\":\"REJECTED\",\"message\":\"Suspicious payment\"}"))
+                .end()
+                .to("jms:queue:bsToPPS");
+
+        // ══════════════════════════════════════════════════════════════════════
+        // FCS — FRAUD CHECK SYSTEM
+        // ══════════════════════════════════════════════════════════════════════
+
+        // ── FCS: Blacklist Engine ──────────────────────────────────────────────
+        // Receives XML → checks blacklists → replies directly back to caller or out to fcsToBS
+        from("jms:queue:bsToFCS")
+                .routeId("fcs-engine")
+                .setProperty("capturedTxId", header("CorrelationTxId"))
+                .unmarshal(jaxbFormat)                                      // XML → PaymentDTO
+                .choice()
+                    .when(simple(
+                        // Name blacklist — payer and payee
                         "${body.payerName} regex '(?i)Mark Imaginary|Govind Real|Shakil Maybe|Chang Imagine' || " +
-                                "${body.payeeName} regex '(?i)Mark Imaginary|Govind Real|Shakil Maybe|Chang Imagine' || " +
-                                "${body.payerCountryCode} in 'CUB,IRQ,IRN,PRK,SDN,SYR' || " +
-                                "${body.payeeCountryCode} in 'CUB,IRQ,IRN,PRK,SDN,SYR' || " +
-                                "${body.payerBank} regex '(?i).*BANK OF KUNLUN.*|.*KARAMAY CITY COMMERCIAL BANK.*' || " +
-                                "${body.payeeBank} regex '(?i).*BANK OF KUNLUN.*|.*KARAMAY CITY COMMERCIAL BANK.*' || " +
-                                "${body.paymentInstruction} regex '(?i).*Artillery Procurement.*|.*Lethal Chemicals payment.*'"
-                ))
-                .setBody(simple(
-                        "<payment>" +
+                        "${body.payeeName} regex '(?i)Mark Imaginary|Govind Real|Shakil Maybe|Chang Imagine' || " +
+                        // Country blacklist — payer and payee
+                        "${body.payerCountryCode} in 'CUB,IRQ,IRN,PRK,SDN,SYR' || " +
+                        "${body.payeeCountryCode} in 'CUB,IRQ,IRN,PRK,SDN,SYR' || " +
+                        // Bank blacklist — payer and payee
+                        "${body.payerBank} regex '(?i).*BANK OF KUNLUN.*|.*KARAMAY CITY COMMERCIAL BANK.*' || " +
+                        "${body.payeeBank} regex '(?i).*BANK OF KUNLUN.*|.*KARAMAY CITY COMMERCIAL BANK.*' || " +
+                        // Payment instruction blacklist
+                        "${body.paymentInstruction} regex '(?i).*Artillery Procurement.*|.*Lethal Chemicals payment.*'"
+                    ))
+                        .setBody(simple(
+                            "<payment>" +
                                 "<transactionId>${body.transactionId}</transactionId>" +
                                 "<status>REJECTED</status>" +
                                 "<message>Suspicious payment</message>" +
-                                "</payment>"
-                ))
-                .otherwise() // Happy path
-                .setBody(simple(
-                        "<payment>" +
+                            "</payment>"
+                        ))
+                    .otherwise()
+                        .setBody(simple(
+                            "<payment>" +
                                 "<transactionId>${body.transactionId}</transactionId>" +
                                 "<status>APPROVED</status>" +
                                 "<message>Nothing found, all okay</message>" +
-                                "</payment>"
-                ))
+                            "</payment>"
+                        ))
                 .end()
-                .to("jms:queue:fcsToBS");
+                .setHeader("CorrelationTxId", exchangeProperty("capturedTxId"))
+                .choice()
+                    .when(header("CorrelationTxId").isNotNull())
+                        // Solution 2 (Sync/InOut): Let Camel handle automatic JMSReplyTo return routing
+                        .log("FCS processing synchronous InOut message.")
+                    .otherwise()
+                        // Solution 1 (Async/InOnly): Directly back to BS for conversion layer processing
+                        .to("jms:queue:fcsToBS")
+                .end();
 
-        /* ==============================================================================
-         * 10. RETURN ROUTING & ASYNC STATUS UPDATES
-         * DEFENSE EXPLANATION: Takes the final XML from the Fraud system, audits it,
-         * and updates the internal database so the client polling route can see the final status.
-         * ============================================================================== */
-        from("jms:queue:fcsToBS")
-                .routeId("bs-result")
-                .wireTap("jms:queue:auditQueue")
-                .to("jms:queue:bsToPPS");
-
-        from("jms:queue:bsToPPS")
-                .routeId("pps-final")
-                .convertBodyTo(String.class)
-                .process(exchange -> {
-                    String body = exchange.getIn().getBody(String.class);
-                    String txId = extractTag(body, "transactionId");
-
-                    // Update internal datastore with final result
-                    if (body.contains("<status>APPROVED</status>")) {
-                        STATUS_STORE.put(txId, "APPROVED");
-                    } else if (body.contains("<status>REJECTED</status>")) {
-                        STATUS_STORE.put(txId, "REJECTED");
-                    }
-                });
-
-        /* ==============================================================================
-         * 11. AUDIT QUEUE
-         * DEFENSE EXPLANATION: A simple sink to log transactions without blocking flow.
-         * ============================================================================== */
+        // ══════════════════════════════════════════════════════════════════════
+        // AUDIT — WIRE TAP TARGET (all components)
+        // ══════════════════════════════════════════════════════════════════════
         from("jms:queue:auditQueue")
                 .routeId("audit")
                 .log("AUDIT EVENT: ${body}");
-    }
-
-    // Helper method to parse the raw XML response without needing full Unmarshalling overhead
-    private static String extractTag(String xml, String tag) {
-        String start = "<" + tag + ">";
-        String end = "</" + tag + ">";
-
-        int s = xml.indexOf(start);
-        int e = xml.indexOf(end);
-
-        if (s == -1 || e == -1) {
-            return "UNKNOWN";
-        }
-
-        return xml.substring(s + start.length(), e);
     }
 }

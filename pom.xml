@@ -56,6 +56,22 @@
             <groupId>org.apache.camel</groupId>
             <artifactId>camel-jacksonxml</artifactId>
         </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-bean</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-jsonpath</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-xpath</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.camel</groupId>
+            <artifactId>camel-direct</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>jakarta.xml.bind</groupId>
@@ -68,7 +84,6 @@
             <version>4.0.0</version>
             <scope>runtime</scope>
         </dependency>
-
         <dependency>
             <groupId>org.apache.activemq</groupId>
             <artifactId>activemq-broker</artifactId>
@@ -80,38 +95,16 @@
             <version>1.5.6</version>
         </dependency>
         <dependency>
-            <groupId>org.apache.camel</groupId>
-            <artifactId>camel-bean</artifactId>
-            <version>4.8.3</version>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.30</version>
+            <scope>provided</scope>
         </dependency>
         <dependency>
-    <groupId>org.apache.camel</groupId>
-    <artifactId>camel-xpath</artifactId>
-    <version>4.8.3</version>
-    </dependency>
-    <dependency>
-    <groupId>org.apache.camel</groupId>
-    <artifactId>camel-direct</artifactId>
-    <version>4.8.3</version>
-</dependency>
-<dependency>
-        <groupId>org.projectlombok</groupId>
-        <artifactId>lombok</artifactId>
-        <version>1.18.30</version>
-        <scope>provided</scope>
-    </dependency>
-    <dependency>
-        <groupId>org.glassfish.jaxb</groupId>
-        <artifactId>jaxb-runtime</artifactId>
-        <version>4.0.4</version>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.camel</groupId>
-        <artifactId>camel-core</artifactId>
-        <version>4.8.3</version>
-    </dependency>
-
-
+            <groupId>org.glassfish.jaxb</groupId>
+            <artifactId>jaxb-runtime</artifactId>
+            <version>4.0.4</version>
+        </dependency>
     </dependencies>
 
     <build>
