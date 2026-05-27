@@ -12,6 +12,15 @@ This PoC demonstrates a secure, decoupled payment fraud screening solution acros
 
 The goal is to validate two integration approaches — synchronous REST and asynchronous JMS — while keeping the fraud logic and protocol mediation fully decoupled from the client-facing payment API.
 
+### Key Capabilities
+
+- Dual integration models: synchronous REST and asynchronous JMS
+- JSON ↔ XML protocol mediation
+- Fraud blacklist screening
+- Request validation
+- Wire Tap audit logging
+- Transaction correlation tracking
+
 ### Core Design Rules
 
 | Rule | Detail |
@@ -109,12 +118,8 @@ transactionId to APPROVED or REJECTED"]
 
     subgraph BS[BS — Broker System]
         direction TB
-        JX["JSON to XML
-Message Translator
-Jackson unmarshal + JAXB marshal"]
-        XJ["XML to JSON
-Message Translator
-XML parse + JSON string"]
+        JX["JSON to XML Translator"]
+        XJ["XML to JSON Translator"]
         AUDIT_BS["Wire Tap
 Audit Logger"]
     end
@@ -176,9 +181,11 @@ sequenceDiagram
     participant PPS
     participant BS
     participant FCS
+    participant AuditQueue
 
     Client ->>+ PPS : Submit Payment (JSON)
     PPS    ->>  PPS : Validate Payment
+    PPS    -->> AuditQueue : Wire Tap — audit copy (non-blocking)
     PPS    -->>- Client : 202 ACCEPTED_FOR_PROCESSING
 
     note over PPS,BS: JSON over JMS Messaging (Async)
@@ -194,6 +201,7 @@ sequenceDiagram
     FCS    ->>  BS  : Fraud Result (XML)
 
     BS     ->>  BS  : Convert XML → JSON
+    BS     -->> AuditQueue : Wire Tap — audit copy (non-blocking)
     BS     ->>  PPS : Fraud Decision (JSON)
 
     PPS    ->>  PPS : Store Final Status
@@ -218,9 +226,11 @@ sequenceDiagram
     participant PPS
     participant BS
     participant FCS
+    participant AuditQueue
 
     Client ->> PPS : Submit Payment (JSON)
     PPS    ->> PPS : Validate Payment
+    PPS    -->> AuditQueue : Wire Tap — audit copy (non-blocking)
 
     alt Validation fails
         PPS -->> Client : 400 Bad Request — validation error
@@ -238,6 +248,7 @@ sequenceDiagram
         FCS ->>  BS  : Fraud Result (XML)
 
         BS  ->>  BS  : Convert XML → JSON
+        BS  -->> AuditQueue : Wire Tap — audit copy (non-blocking)
         BS  -->> PPS : Fraud Decision (JSON)
 
         PPS -->> Client : 200 APPROVED or 403 REJECTED
@@ -246,22 +257,22 @@ sequenceDiagram
 
 ---
 
-## 8. System Responsibilities
+## 8. UML Audit Flow — Wire Tap Pattern
 
-### PPS — Payment Processing System
-- Accept JSON payment requests
-- Validate request payload
-- Trigger synchronous or asynchronous fraud screening
-- Store async processing status
+> The Wire Tap pattern captures a copy of every message without interrupting the main flow. Both PPS and BS tap into the shared `auditQueue`.
 
-### BS — Broker System
-- Route requests between PPS and FCS
-- Transform JSON ↔ XML
-- Handle protocol mediation
+```mermaid
+%%{init: {"sequence": {"width": 200, "actorFontSize": 14, "noteFontSize": 13, "messageFontSize": 13, "mirrorActors": false}} }%%
+sequenceDiagram
+    participant PPS
+    participant BS
+    participant AuditQueue
+    participant Logger
 
-### FCS — Fraud Check System
-- Execute fraud screening rules
-- Return APPROVED / REJECTED decision
+    PPS ->> AuditQueue : Wire Tap — copy incoming payment event
+    BS  ->> AuditQueue : Wire Tap — copy transformation / result event
+    AuditQueue ->> Logger : Structured audit log entry (correlationId · timestamp · payload)
+```
 
 ---
 
@@ -337,36 +348,46 @@ Fraud checks cover: blocked payer/payee names · restricted countries (sanctione
 
 ---
 
-## 11. Project Structure
+## 11. UML Class Diagram — Code Structure
 
-```
-bank-payment-fraud-poc/
-|
-+-- pom.xml                          Maven build — Camel 4.8, ActiveMQ 6
-+-- Dockerfile                       Multi-stage: maven:3.9 build to temurin:17-jre run
-+-- .gitignore                       Ignore target/, IDE files, logs, temp artifacts
-+-- README.md                        This file
-|
-+-- src/
-    +-- main/
-        +-- java/com/bank/
-        |   +-- BankApplication.java      Entry point — Camel Main + embedded ActiveMQ
-        |   +-- PaymentApp.java           All Camel routes — PPS, BS, FCS logic
-        |   +-- model/
-        |   |   +-- PaymentDTO.java       14-field POJO — Jackson JSON + JAXB XML
-        |   +-- service/
-        |       +-- PaymentValidator.java PPS validation — 13 mandatory fields, paymentInstruction optional
-        +-- resources/
-            +-- application.properties   MDC logging — correlationId tracking
-            +-- logback.xml              Structured log pattern with correlationId
-```
+```mermaid
+classDiagram
+    class BankApplication {
+        +main(String[] args)
+    }
 
-| File | Responsibility |
-|---|---|
-| `BankApplication.java` | Starts Camel Main · binds embedded ActiveMQ · registers all routes |
-| `PaymentApp.java` | All business logic — 8 Camel routes covering PPS, BS, FCS for both solutions |
-| `PaymentDTO.java` | Shared data model — Jackson for JSON · JAXB for XML in one POJO |
-| `PaymentValidator.java` | Validates UUID · ISO country · ISO currency · amount · date · 13 mandatory fields · `paymentInstruction` is optional |
+    class PaymentApp {
+        +configure()
+        -PaymentValidator validator
+        -JaxbDataFormat jaxbFormat
+    }
+
+    class PaymentDTO {
+        +transactionId
+        +payerName
+        +payerBank
+        +payerCountryCode
+        +payerAccount
+        +payeeName
+        +payeeBank
+        +payeeCountryCode
+        +payeeAccount
+        +paymentInstruction
+        +executionDate
+        +amount
+        +currency
+        +creationTimestamp
+    }
+
+    class PaymentValidator {
+        +validate(PaymentDTO)
+    }
+
+    BankApplication --> PaymentApp
+    PaymentApp --> PaymentValidator
+    PaymentApp --> PaymentDTO
+    PaymentValidator --> PaymentDTO
+```
 
 ---
 
@@ -405,8 +426,6 @@ docker run -d -p 8080:8080 --name bank-fraud-poc-container bank-fraud-poc
 docker logs -f bank-fraud-poc-container
 ```
 
-> **GCP deployment:** Application runs containerised on a Google Compute Engine VM. Structured logs with correlationId are visible in Google Cloud Logging.
-
 ---
 
 ## 14. API Endpoints
@@ -441,7 +460,7 @@ curl -i -X POST http://localhost:8080/api/v1/payments \
 
 Response — HTTP 200:
 ```json
-{"transactionId":"550e8400...","status":"APPROVED","message":"Nothing found, all okay","reason":""}
+{"transactionId":"550e8400...","status":"APPROVED"}
 ```
 
 ### Example — Solution 1 Asynchronous (Submit + Poll)
